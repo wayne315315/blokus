@@ -34,7 +34,9 @@ class RandomGreedyBot:
                             shifted_coords = [(r + dr, c + dc) for dr, dc in current_coords]
                             if is_valid_move(board, color_id, shifted_coords, is_first_move):
                                 return shape_name, shifted_coords
-        return None
+                                
+        # Returns a consistent tuple of (None, None) so unpacking doesn't crash
+        return None, None
 
 # ==============================================================================
 # GPU INFERENCE SERVER
@@ -125,7 +127,6 @@ def _thread_test_games(num_games, conn, play_as_first):
         inventories = { 1: list(SHAPES.keys()), 2: list(SHAPES.keys()), 3: list(SHAPES.keys()), 4: list(SHAPES.keys()) }
         first_moves = {1: True, 2: True, 3: True, 4: True}
         
-        # Determine who plays which colors
         if play_as_first:
             color_map = {1: az_bot, 2: std_bot, 3: az_bot, 4: std_bot}
         else:
@@ -139,14 +140,12 @@ def _thread_test_games(num_games, conn, play_as_first):
             available_shapes = inventories[current_color]
             is_first = first_moves[current_color]
             
-            # The AZ bot handles the `is_first_move` differently in get_play compared to greedy bot structure,
-            # so we ensure both match the expected interface: get_play(board, color_id, shapes, is_first)
-            action = active_bot.get_play(board, current_color, available_shapes, is_first)
+            # FIXED: Safely unpack the tuple, catching the None inside shape_name
+            shape_name, coords = active_bot.get_play(board, current_color, available_shapes, is_first)
             
-            if action is None:
+            if shape_name is None:
                 pass_count += 1
             else:
-                shape_name, coords = action
                 for r, c in coords:
                     board[r][c] = current_color
                 inventories[current_color].remove(shape_name)
@@ -193,7 +192,6 @@ def distributed_test_worker(num_games, conns, result_queue, worker_idx):
         futures = []
         for i in range(threads_count):
             if thread_tasks[i] > 0:
-                # Half the threads play as Blue/Red, Half play as Yellow/Green to ensure fairness
                 play_first = (i % 2 == 0)
                 futures.append(executor.submit(_thread_test_games, thread_tasks[i], conns[i], play_first))
         
@@ -289,5 +287,4 @@ def test_model(num_games=100, policy_path="tf_policy_model.keras", num_workers=N
 
 if __name__ == "__main__":
     mp.freeze_support()
-    # 200 is a good sample size. You can increase it, but Blokus inference takes longer than Big Two!
     test_model(num_games=200, threads_per_worker=10)
