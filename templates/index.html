@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Blokus 4-Color</title>
+    <style>
+        body { font-family: Arial, sans-serif; background-color: #2E4053; color: white; text-align: center; margin: 0; padding: 20px; }
+        .section-title { color: #ECF0F1; border-bottom: 1px solid #7F8C8D; padding-bottom: 5px; }
+        
+        #board-area { background-color: #34495E; padding: 20px; border-radius: 10px; display: inline-block; margin-bottom: 20px;}
+        #board { display: grid; grid-template-columns: repeat(20, 22px); gap: 1px; }
+        
+        .cell { width: 22px; height: 22px; background-color: #BDC3C7; cursor: pointer; border-radius: 2px; box-sizing: border-box; }
+        .cell.c1 { background-color: #3498DB; border: 1px solid #2980B9; }
+        .cell.c2 { background-color: #F1C40F; border: 1px solid #F39C12; }
+        .cell.c3 { background-color: #E74C3C; border: 1px solid #C0392B; }
+        .cell.c4 { background-color: #2ECC71; border: 1px solid #27AE60; }
+        
+        .cell.start-1 { border: 2px dashed #3498DB; }
+        .cell.start-2 { border: 2px dashed #F1C40F; }
+        .cell.start-3 { border: 2px dashed #E74C3C; }
+        .cell.start-4 { border: 2px dashed #2ECC71; }
+        .cell.ghost { background-color: rgba(255, 255, 255, 0.6); border: 1px dashed white; }
+        
+        /* 4-Player Inventories Layout */
+        .inventories-container { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; max-width: 1000px; margin: 0 auto; }
+        .inventory-box { border: 3px solid #7F8C8D; border-radius: 10px; padding: 10px; background-color: #2C3E50; opacity: 0.4; transition: all 0.3s ease; }
+        .inventory-box h4 { margin: 0 0 10px 0; color: #ECF0F1; font-size: 18px; }
+        
+        /* Active Turn Highlighting */
+        .inventory-box.active { opacity: 1; transform: scale(1.02); }
+        #inv-box-1.active { border-color: #3498DB; box-shadow: 0 0 15px rgba(52, 152, 219, 0.5); }
+        #inv-box-2.active { border-color: #F1C40F; box-shadow: 0 0 15px rgba(241, 196, 15, 0.5); }
+        #inv-box-3.active { border-color: #E74C3C; box-shadow: 0 0 15px rgba(231, 76, 60, 0.5); }
+        #inv-box-4.active { border-color: #2ECC71; box-shadow: 0 0 15px rgba(46, 204, 113, 0.5); }
+        
+        /* Graphical Inventory Styles */
+        .shapes-area { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; min-height: 80px;}
+        .shape-btn { padding: 4px; background-color: #34495E; border: 2px solid transparent; border-radius: 4px; display: flex; align-items: center; justify-content: center; transition: transform 0.1s;}
+        
+        /* Only make them look clickable if they belong to the active human */
+        .inventory-box.active.human-turn .shape-btn { cursor: pointer; border-color: #7F8C8D; }
+        .inventory-box.active.human-turn .shape-btn:hover { transform: scale(1.1); border-color: #ECF0F1; }
+        .shape-btn.selected { border-color: #FFFFFF !important; background-color: #1A252F; box-shadow: 0 0 10px white; transform: scale(1.1); }
+        
+        .mini-shape { position: relative; }
+        .mini-block { position: absolute; width: 10px; height: 10px; box-sizing: border-box; border-radius: 1px; }
+        
+        /* Dynamic Shape Colors based on container */
+        #inv-box-1 .mini-block { background-color: #3498DB; border: 1px solid #2980B9; }
+        #inv-box-2 .mini-block { background-color: #F1C40F; border: 1px solid #F39C12; }
+        #inv-box-3 .mini-block { background-color: #E74C3C; border: 1px solid #C0392B; }
+        #inv-box-4 .mini-block { background-color: #2ECC71; border: 1px solid #27AE60; }
+        
+        .controls { margin-top: 20px; }
+        button { padding: 10px 20px; font-size: 16px; font-weight: bold; margin: 5px; cursor: pointer; border-radius: 5px; border: none; }
+        .btn-pass { background-color: #7F8C8D; color: white; }
+        .btn-bot { background-color: #8E44AD; color: white; }
+        .btn-reset { background-color: #95A5A6; color: white; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        
+        #message { font-size: 20px; color: #F1C40F; margin-bottom: 5px; font-weight: bold;}
+        .instruction { font-size: 14px; color: #ECF0F1; margin-bottom: 15px; }
+        
+        #turn-indicator { font-size: 24px; font-weight: bold; margin: 10px 0; }
+        .text-1 { color: #3498DB; }
+        .text-2 { color: #F1C40F; }
+        .text-3 { color: #E74C3C; }
+        .text-4 { color: #2ECC71; }
+        
+        /* Scoreboard */
+        #scoreboard { display: none; background-color: #1A252F; border: 2px solid #F1C40F; padding: 15px; border-radius: 10px; margin: 15px auto; max-width: 400px; }
+        .score-row { display: flex; justify-content: space-between; font-size: 18px; margin: 5px 0; }
+    </style>
+</head>
+<body>
+
+    <h2 class="section-title">Blokus (4 Colors - 2 Player)</h2>
+    <div id="turn-indicator">Loading...</div>
+    <div id="message"></div>
+    
+    <div id="scoreboard">
+        <div class="score-row"><span class="text-1">Blue</span><span id="score-1">0</span></div>
+        <div class="score-row"><span class="text-3">Red</span><span id="score-3">0</span></div>
+        <hr style="border-color: #7F8C8D;">
+        <div class="score-row" style="font-weight:bold;"><span>YOUR TOTAL:</span><span id="score-p1">0</span></div>
+        <br>
+        <div class="score-row"><span class="text-2">Yellow</span><span id="score-2">0</span></div>
+        <div class="score-row"><span class="text-4">Green</span><span id="score-4">0</span></div>
+        <hr style="border-color: #7F8C8D;">
+        <div class="score-row" style="font-weight:bold;"><span>BOT TOTAL:</span><span id="score-bot">0</span></div>
+    </div>
+
+    <div class="instruction">Controls: Press <b>'R'</b> to Rotate | Press <b>'F'</b> to Flip</div>
+
+    <div id="board-area">
+        <div id="board"></div>
+    </div>
+
+    <div class="controls">
+        <button id="btn-pass" class="btn-pass" onclick="passTurn()" disabled>Skip Turn (Blocked)</button>
+        <button id="btn-bot" class="btn-bot" onclick="triggerBot()" disabled>Let Bot Play</button>
+        <button class="btn-reset" onclick="resetGame()">New Game</button>
+    </div>
+
+    <div class="inventories-container">
+        <div id="inv-box-1" class="inventory-box">
+            <h4 class="text-1">Blue (You)</h4>
+            <div id="shapes-1" class="shapes-area"></div>
+        </div>
+        <div id="inv-box-2" class="inventory-box">
+            <h4 class="text-2">Yellow (Bot)</h4>
+            <div id="shapes-2" class="shapes-area"></div>
+        </div>
+        <div id="inv-box-3" class="inventory-box">
+            <h4 class="text-3">Red (You)</h4>
+            <div id="shapes-3" class="shapes-area"></div>
+        </div>
+        <div id="inv-box-4" class="inventory-box">
+            <h4 class="text-4">Green (Bot)</h4>
+            <div id="shapes-4" class="shapes-area"></div>
+        </div>
+    </div>
+
+    <script>
+        const SHAPES_DEF = {
+            "1_I1": [[0,0]], "2_I2": [[0,0], [0,1]], "3_I3": [[0,0], [0,1], [0,2]], "3_V3": [[0,0], [1,0], [1,1]],
+            "4_I4": [[0,0], [0,1], [0,2], [0,3]], "4_L4": [[0,0], [1,0], [2,0], [2,1]], "4_T4": [[0,0], [0,1], [0,2], [1,1]],
+            "4_O4": [[0,0], [0,1], [1,0], [1,1]], "4_Z4": [[0,0], [0,1], [1,1], [1,2]], "5_I5": [[0,0], [0,1], [0,2], [0,3], [0,4]],
+            "5_L5": [[0,0], [1,0], [2,0], [3,0], [3,1]], "5_Y5": [[0,0], [0,1], [0,2], [0,3], [1,1]],
+            "5_N5": [[0,0], [0,1], [1,1], [1,2], [1,3]], "5_P5": [[0,0], [0,1], [1,0], [1,1], [2,0]],
+            "5_U5": [[0,0], [0,1], [1,0], [1,2], [0,2]], "5_V5": [[0,0], [1,0], [2,0], [2,1], [2,2]],
+            "5_Z5": [[0,0], [0,1], [1,1], [2,1], [2,2]], "5_T5": [[0,0], [0,1], [0,2], [1,1], [2,1]],
+            "5_F5": [[0,1], [0,2], [1,0], [1,1], [2,1]], "5_W5": [[0,0], [1,0], [1,1], [2,1], [2,2]],
+            "5_X5": [[0,1], [1,0], [1,1], [1,2], [2,1]]
+        };
+
+        const COLOR_NAMES = { 1: "Blue (You)", 2: "Yellow (Bot)", 3: "Red (You)", 4: "Green (Bot)" };
+
+        let currentState = {};
+        let selectedShapeName = null;
+        let currentRotation = 0; 
+        let currentFlip = false;
+
+        document.addEventListener('keydown', (e) => {
+            if (!selectedShapeName) return;
+            if (e.key.toLowerCase() === 'r') {
+                currentRotation = (currentRotation + 90) % 360;
+                renderUI(); 
+            }
+            if (e.key.toLowerCase() === 'f') {
+                currentFlip = !currentFlip;
+                renderUI();
+            }
+        });
+
+        window.onload = fetchState;
+
+        async function fetchState() {
+            const response = await fetch('/api/state');
+            currentState = await response.json();
+            renderUI();
+            checkBotTurn();
+        }
+
+        function getTransformedCoords(baseCoords) {
+            return baseCoords.map(coord => {
+                let r = coord[0];
+                let c = coord[1];
+                if (currentFlip) c = -c;
+                for(let i = 0; i < currentRotation / 90; i++) {
+                    let temp = r;
+                    r = c;
+                    c = -temp;
+                }
+                return [r, c];
+            });
+        }
+
+        function createShapeGraphic(shapeName) {
+            const coords = SHAPES_DEF[shapeName];
+            
+            let minR = Math.min(...coords.map(c => c[0]));
+            let maxR = Math.max(...coords.map(c => c[0]));
+            let minC = Math.min(...coords.map(c => c[1]));
+            let maxC = Math.max(...coords.map(c => c[1]));
+            
+            const blockSize = 10; 
+            const width = (maxC - minC + 1) * blockSize;
+            const height = (maxR - minR + 1) * blockSize;
+            
+            const container = document.createElement('div');
+            container.className = 'mini-shape';
+            container.style.width = width + 'px';
+            container.style.height = height + 'px';
+            
+            coords.forEach(c => {
+                const block = document.createElement('div');
+                block.className = 'mini-block';
+                block.style.top = ((c[0] - minR) * blockSize) + 'px';
+                block.style.left = ((c[1] - minC) * blockSize) + 'px';
+                container.appendChild(block);
+            });
+            
+            return container;
+        }
+
+        function handleMouseOver(row, col) {
+            const isHumanTurn = [1, 3].includes(currentState.current_color);
+            if (!selectedShapeName || !isHumanTurn) return;
+            
+            document.querySelectorAll('.ghost').forEach(el => el.classList.remove('ghost'));
+            
+            const transformedCoords = getTransformedCoords(SHAPES_DEF[selectedShapeName]);
+            transformedCoords.forEach(coord => {
+                let targetRow = row + coord[0];
+                let targetCol = col + coord[1];
+                if (targetRow >= 0 && targetRow < 20 && targetCol >= 0 && targetCol < 20) {
+                    let cellIndex = targetRow * 20 + targetCol; 
+                    let cells = document.querySelectorAll('.cell');
+                    if(cells[cellIndex]) cells[cellIndex].classList.add('ghost');
+                }
+            });
+        }
+
+        function renderUI() {
+            document.getElementById('message').innerText = currentState.message;
+            const turnIndicator = document.getElementById('turn-indicator');
+            const scoreboard = document.getElementById('scoreboard');
+            
+            if(currentState.is_game_over){
+                turnIndicator.innerText = "GAME OVER";
+                turnIndicator.className = "";
+                
+                if(currentState.final_scores) {
+                    document.getElementById('score-1').innerText = currentState.final_scores.details[1];
+                    document.getElementById('score-2').innerText = currentState.final_scores.details[2];
+                    document.getElementById('score-3').innerText = currentState.final_scores.details[3];
+                    document.getElementById('score-4').innerText = currentState.final_scores.details[4];
+                    document.getElementById('score-p1').innerText = currentState.final_scores.p1;
+                    document.getElementById('score-bot').innerText = currentState.final_scores.bot;
+                    scoreboard.style.display = 'block';
+                }
+            } else {
+                scoreboard.style.display = 'none';
+                turnIndicator.innerText = `Current Turn: ${COLOR_NAMES[currentState.current_color]}`;
+                turnIndicator.className = `text-${currentState.current_color}`;
+            }
+            
+            // Render Board
+            const boardDiv = document.getElementById('board');
+            boardDiv.innerHTML = '';
+            currentState.board.forEach((row, r) => {
+                row.forEach((cell, c) => {
+                    const div = document.createElement('div');
+                    div.className = 'cell';
+                    if (cell > 0) div.classList.add(`c${cell}`);
+                    
+                    if (cell === 0) {
+                        if (r===0 && c===0) div.classList.add('start-1');
+                        if (r===0 && c===19) div.classList.add('start-2');
+                        if (r===19 && c===19) div.classList.add('start-3');
+                        if (r===19 && c===0) div.classList.add('start-4');
+                    }
+
+                    div.onmouseover = () => handleMouseOver(r, c);
+                    div.onmouseout = () => { document.querySelectorAll('.ghost').forEach(el => el.classList.remove('ghost')); };
+                    div.onclick = () => handleBoardClick(r, c);
+                    boardDiv.appendChild(div);
+                });
+            });
+
+            // Render ALL 4 Inventories
+            [1, 2, 3, 4].forEach(colorId => {
+                const boxDiv = document.getElementById(`inv-box-${colorId}`);
+                const shapesDiv = document.getElementById(`shapes-${colorId}`);
+                shapesDiv.innerHTML = '';
+                
+                const isActiveTurn = (currentState.current_color === colorId && !currentState.is_game_over);
+                const isHumanControlled = [1, 3].includes(colorId);
+                
+                // Set classes for active styling
+                boxDiv.className = 'inventory-box' + (isActiveTurn ? ' active' : '') + ((isActiveTurn && isHumanControlled) ? ' human-turn' : '');
+
+                const shapesList = currentState.inventories[colorId];
+                
+                shapesList.forEach(shape => {
+                    const btn = document.createElement('div');
+                    btn.className = 'shape-btn' + (selectedShapeName === shape ? ' selected' : '');
+                    btn.appendChild(createShapeGraphic(shape)); 
+                    
+                    // ONLY allow clicking if it's this color's turn AND the human controls it
+                    if (isActiveTurn && isHumanControlled) {
+                        btn.onclick = () => {
+                            selectedShapeName = shape;
+                            currentRotation = 0;
+                            currentFlip = false;
+                            renderUI(); 
+                        };
+                    }
+                    
+                    shapesDiv.appendChild(btn);
+                });
+            });
+            
+            // Enable Pass button only on human turns
+            document.getElementById('btn-pass').disabled = !([1, 3].includes(currentState.current_color) && !currentState.is_game_over);
+        }
+
+        async function handleBoardClick(row, col) {
+            const isHumanTurn = [1, 3].includes(currentState.current_color);
+            if (!isHumanTurn || !selectedShapeName || currentState.is_game_over) return;
+
+            const transformedCoords = getTransformedCoords(SHAPES_DEF[selectedShapeName]);
+            const absoluteCoords = transformedCoords.map(coord => [row + coord[0], col + coord[1]]);
+
+            try {
+                const response = await fetch('/api/play', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ shape_name: selectedShapeName, coords: absoluteCoords })
+                });
+                
+                const data = await response.json();
+                if (data.error) {
+                    alert(data.error);
+                } else {
+                    currentState = data;
+                    selectedShapeName = null;
+                    currentRotation = 0;
+                    currentFlip = false;
+                    renderUI();
+                    checkBotTurn();
+                }
+            } catch (err) {
+                console.error("Server crashed:", err);
+                alert("Server Error! Check your Python terminal for the crash log.");
+            }
+        }
+
+        async function passTurn() {
+            const response = await fetch('/api/pass', { method: 'POST' });
+            currentState = await response.json();
+            selectedShapeName = null;
+            renderUI();
+            checkBotTurn();
+        }
+
+        function checkBotTurn() {
+            const botBtn = document.getElementById('btn-bot');
+            const isBotTurn = [2, 4].includes(currentState.current_color);
+            botBtn.disabled = (!isBotTurn || currentState.is_game_over);
+            
+            if (isBotTurn && !currentState.is_game_over) {
+                setTimeout(triggerBot, 500);
+            }
+        }
+
+        async function triggerBot() {
+            const response = await fetch('/api/bot_turn', { method: 'POST' });
+            currentState = await response.json();
+            renderUI();
+            checkBotTurn(); 
+        }
+
+        async function resetGame() {
+            const response = await fetch('/api/reset', { method: 'POST' });
+            currentState = await response.json();
+            selectedShapeName = null;
+            document.getElementById('scoreboard').style.display = 'none';
+            renderUI();
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,2 @@
+tensorflow[and-cuda]==2.18
+flask==3.1.3
