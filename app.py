@@ -122,10 +122,13 @@ def bot_turn():
     color_id = game_instance['current_color']
     if color_id not in [2, 4]: return get_state()
         
-    available_shapes = game_instance['inventories'][str(color_id)]
-    is_first = game_instance['first_moves'][color_id]
-    
-    shape_name, coords = bot_instance.get_play(game_instance['board'], color_id, available_shapes, is_first)
+    shape_name, coords = bot_instance.get_play(
+        game_instance['board'], 
+        color_id, 
+        game_instance['inventories'], 
+        game_instance['first_moves'], 
+        game_instance['pass_count']
+    )
     
     color_name = "Yellow" if color_id == 2 else "Green"
 

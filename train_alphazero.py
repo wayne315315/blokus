@@ -1,5 +1,6 @@
 import os
 import time
+import math
 import pickle
 import numpy as np
 import multiprocessing as mp
@@ -34,7 +35,7 @@ def add_to_buffer(buffer_x, buffer_y, new_x, new_y, current_size, max_size):
         return max_size
 
 def gpu_inference_server(conns, fast_val_infer, fast_pol_infer):
-    FIXED_BATCH = 8192  # Reduced due to larger 2D tensor size
+    FIXED_BATCH = 8192  
     active_conns = list(conns)
     
     MIN_BATCH_SIZE = 256
@@ -125,13 +126,14 @@ def gpu_inference_server(conns, fast_val_infer, fast_pol_infer):
             last_fire_time = time.time()
 
 def _thread_simulate_games(num_games, conn, current_episode, total_episodes):
-    progress = min(1.0, current_episode / (2000000 * 0.8))
-    current_exploration = max(0.02, 0.20 - (progress * 0.18))
+    
+    # COSINE ANNEALING: Bounces exploration between 0.35 and 0.02
+    progress = min(1.0, current_episode / total_episodes)
+    current_exploration = 0.02 + 0.5 * (0.35 - 0.02) * (1 + math.cos(math.pi * progress))
 
     bot1 = BlokusAlphaZeroBot("P1 (Blue/Red)", pipe=conn, is_training=True, exploration_rate=current_exploration)
     bot2 = BlokusAlphaZeroBot("P2 (Yellow/Green)", pipe=conn, is_training=True, exploration_rate=current_exploration)
     
-    # Map colors to bots: 1,3 -> bot1; 2,4 -> bot2
     color_map = {1: bot1, 2: bot2, 3: bot1, 4: bot2}
 
     accumulated_train_x, accumulated_train_y = [], []
@@ -153,11 +155,9 @@ def _thread_simulate_games(num_games, conn, current_episode, total_episodes):
 
         while pass_count < 4:
             active_bot = color_map[current_color]
-            available_shapes = inventories[current_color]
-            is_first = first_moves[current_color]
             
-            # FIXED: Safely unpack the tuple, expecting (None, None) when blocked
-            shape_name, coords = active_bot.get_play(board, current_color, available_shapes, is_first)
+            # FULL MCTS Call
+            shape_name, coords = active_bot.get_play(board, current_color, inventories, first_moves, pass_count)
             
             if shape_name is None:
                 pass_count += 1
@@ -171,7 +171,6 @@ def _thread_simulate_games(num_games, conn, current_episode, total_episodes):
                 
             current_color = (current_color % 4) + 1
 
-        # Game Over - Calculate Blokus Scores
         def get_score(col_id):
             return sum(-int(shape.split('_')[0]) for shape in inventories[col_id])
 
@@ -191,7 +190,7 @@ def _thread_simulate_games(num_games, conn, current_episode, total_episodes):
 
         for step in bot1.episode_memory:
             accumulated_train_x.append(step['inputs'][step['chosen_index']])
-            accumulated_train_y.append(p1_reward) # AZ uses pure absolute outcome
+            accumulated_train_y.append(p1_reward) 
             
         for mem in bot1.policy_memory:
             policy_x.append(mem[0])

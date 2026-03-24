@@ -14,11 +14,14 @@ from helper import BOARD_SIZE, SHAPES, is_valid_move, rotate_shape, flip_shape
 from tf_alphazero_bot import BlokusAlphaZeroBot, create_policy_network
 
 # ==============================================================================
-# STANDARD GREEDY BOT (The baseline opponent)
+# STANDARD GREEDY BOT
 # ==============================================================================
 class RandomGreedyBot:
-    def get_play(self, board, color_id, available_shapes, is_first_move):
-        # Shuffles remaining shapes to add randomness, then plays the first valid move
+    def get_play(self, board, color_id, inventories, first_moves, pass_count=0):
+        inv_key = str(color_id) if str(color_id) in inventories else color_id
+        available_shapes = inventories[inv_key]
+        is_first_move = first_moves[color_id]
+        
         shapes_to_try = list(available_shapes)
         random.shuffle(shapes_to_try) 
         
@@ -35,7 +38,6 @@ class RandomGreedyBot:
                             if is_valid_move(board, color_id, shifted_coords, is_first_move):
                                 return shape_name, shifted_coords
                                 
-        # Returns a consistent tuple of (None, None) so unpacking doesn't crash
         return None, None
 
 # ==============================================================================
@@ -137,11 +139,8 @@ def _thread_test_games(num_games, conn, play_as_first):
 
         while pass_count < 4:
             active_bot = color_map[current_color]
-            available_shapes = inventories[current_color]
-            is_first = first_moves[current_color]
             
-            # FIXED: Safely unpack the tuple, catching the None inside shape_name
-            shape_name, coords = active_bot.get_play(board, current_color, available_shapes, is_first)
+            shape_name, coords = active_bot.get_play(board, current_color, inventories, first_moves, pass_count)
             
             if shape_name is None:
                 pass_count += 1
@@ -175,9 +174,6 @@ def _thread_test_games(num_games, conn, play_as_first):
             
     return az_wins, std_wins, ties, az_score_diff
 
-# ==============================================================================
-# WORKER PROCESS
-# ==============================================================================
 def distributed_test_worker(num_games, conns, result_queue, worker_idx):
     os.environ['CUDA_VISIBLE_DEVICES'] = '-1' 
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -194,7 +190,6 @@ def distributed_test_worker(num_games, conns, result_queue, worker_idx):
             if thread_tasks[i] > 0:
                 play_first = (i % 2 == 0)
                 futures.append(executor.submit(_thread_test_games, thread_tasks[i], conns[i], play_first))
-        
         for future in futures:
             results.append(future.result())
 
@@ -210,16 +205,12 @@ def distributed_test_worker(num_games, conns, result_queue, worker_idx):
 
     result_queue.put((total_az_wins, total_std_wins, total_ties, total_diff))
 
-# ==============================================================================
-# MAIN EXECUTOR
-# ==============================================================================
 def test_model(num_games=100, policy_path="tf_policy_model.keras", num_workers=None, threads_per_worker=10):
     print("="*60)
     print(f"DISTRIBUTED FLOAT16 GPU BENCHMARK (BLOKUS - {num_games} GAMES)")
     print("="*60)
     
-    if num_workers is None:
-        num_workers = max(1, mp.cpu_count() - 1)
+    if num_workers is None: num_workers = max(1, mp.cpu_count() - 1)
         
     if num_games < num_workers * threads_per_worker:
         num_workers = max(1, num_games // threads_per_worker)
@@ -269,8 +260,7 @@ def test_model(num_games=100, policy_path="tf_policy_model.keras", num_workers=N
         total_ties += t
         total_diff += diff
 
-    for p in processes:
-        p.join()
+    for p in processes: p.join()
         
     elapsed = time.time() - start_time
     avg_diff = total_diff / num_games
