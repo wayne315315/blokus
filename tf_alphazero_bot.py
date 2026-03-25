@@ -162,7 +162,7 @@ class BlokusAlphaZeroBot:
             for r, c in action[1]:
                 batch_inputs[i, r, c, 4] = 1.0
         
-        if self.is_training and self.pipe:
+        if self.pipe is not None:
             self.pipe.send((False, batch_inputs.astype(np.float16)))
             values = self.pipe.recv().flatten().tolist()
             self.pipe.send((True, batch_inputs.astype(np.float16)))
@@ -188,7 +188,7 @@ class BlokusAlphaZeroBot:
         root.visits = len(legal_actions)
 
         # --- MCTS SIMULATION LOOP ---
-        num_sims = 15 if self.is_training else 50
+        num_sims = 15 if self.is_training else 15
         for _ in range(num_sims):
             node = root
             c_board = [row[:] for row in board]
@@ -232,7 +232,7 @@ class BlokusAlphaZeroBot:
                     if a[0] is not None:
                         for r, c in a[1]: b_inputs[i, r, c, 4] = 1.0
                         
-                if self.is_training and self.pipe:
+                if self.pipe is not None:
                     self.pipe.send((False, b_inputs.astype(np.float16)))
                     n_vals = self.pipe.recv().flatten().tolist()
                     self.pipe.send((True, b_inputs.astype(np.float16)))

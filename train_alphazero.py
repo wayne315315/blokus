@@ -35,11 +35,13 @@ def add_to_buffer(buffer_x, buffer_y, new_x, new_y, current_size, max_size):
         return max_size
 
 def gpu_inference_server(conns, fast_val_infer, fast_pol_infer):
-    FIXED_BATCH = 8192  
+    # --- TUNED FOR NVIDIA L4 (24GB VRAM) ---
+    FIXED_BATCH = 12288 
+    MIN_BATCH_SIZE = 8192
+    MAX_WAIT_TIME = 0.01
+    # ---------------------------------------
+
     active_conns = list(conns)
-    
-    MIN_BATCH_SIZE = 256
-    MAX_WAIT_TIME = 0.01 
 
     val_buffer = np.zeros((FIXED_BATCH, 20, 20, 6), dtype=np.float16)
     pol_buffer = np.zeros((FIXED_BATCH, 20, 20, 6), dtype=np.float16)
@@ -66,7 +68,9 @@ def gpu_inference_server(conns, fast_val_infer, fast_pol_infer):
                     length = len(inputs)
                     
                     if is_policy:
+                        # Policy Buffer Full - Fire instantly
                         if pol_cursor + length > FIXED_BATCH:
+                            print(f"[DEBUG] Pol Batch Fired (Buffer Full): {pol_cursor}")
                             tensor = tf.convert_to_tensor(pol_buffer, dtype=tf.float16)
                             preds = fast_pol_infer(tensor).numpy()
                             idx = 0
@@ -82,7 +86,9 @@ def gpu_inference_server(conns, fast_val_infer, fast_pol_infer):
                         pol_lens.append(length)
                         pol_cursor += length
                     else:
+                        # Value Buffer Full - Fire instantly
                         if val_cursor + length > FIXED_BATCH:
+                            print(f"[DEBUG] Val Batch Fired (Buffer Full): {val_cursor}")
                             tensor = tf.convert_to_tensor(val_buffer, dtype=tf.float16)
                             preds = fast_val_infer(tensor).numpy()
                             idx = 0
@@ -103,7 +109,9 @@ def gpu_inference_server(conns, fast_val_infer, fast_pol_infer):
 
         time_waiting = time.time() - last_fire_time
 
+        # Time/Minimum Threshold Firing Checks
         if val_cursor >= MIN_BATCH_SIZE or (time_waiting > MAX_WAIT_TIME and val_cursor > 0):
+            print(f"[DEBUG] Val batch size: {val_cursor}")
             tensor = tf.convert_to_tensor(val_buffer, dtype=tf.float16)
             preds = fast_val_infer(tensor).numpy()
             idx = 0
@@ -115,6 +123,7 @@ def gpu_inference_server(conns, fast_val_infer, fast_pol_infer):
             last_fire_time = time.time()
                 
         if pol_cursor >= MIN_BATCH_SIZE or (time_waiting > MAX_WAIT_TIME and pol_cursor > 0):
+            print(f"[DEBUG] Pol batch size: {pol_cursor}")
             tensor = tf.convert_to_tensor(pol_buffer, dtype=tf.float16)
             preds = fast_pol_infer(tensor).numpy()
             idx = 0
@@ -124,6 +133,7 @@ def gpu_inference_server(conns, fast_val_infer, fast_pol_infer):
             pol_pipes, pol_lens = [], []
             pol_cursor = 0
             last_fire_time = time.time()
+
 
 def _thread_simulate_games(num_games, conn, current_episode, total_episodes):
     
@@ -299,7 +309,10 @@ def train_self_play(total_episodes=200000, batch_size=2048, val_path='tf_value_m
         optimizer_pol.apply_gradients(zip(grads, shared_pol_net.trainable_variables))
         return loss
 
-    FIXED_BATCH = 8192
+    # --- Match this to your tuned Server settings above ---
+    FIXED_BATCH = 12288
+    # ------------------------------------------------------
+
     @tf.function(input_signature=[tf.TensorSpec(shape=(FIXED_BATCH, 20, 20, 6), dtype=tf.float16)], jit_compile=True)
     def fast_val_infer(batch): return shared_val_net(batch, training=False)
 
@@ -357,7 +370,7 @@ def train_self_play(total_episodes=200000, batch_size=2048, val_path='tf_value_m
         child_conn_chunks = [child_conns[i * threads_per_worker : (i + 1) * threads_per_worker] for i in range(num_workers)]
         result_queue = ctx.Queue()
 
-        print("  [Phase 1] Simulation (CPU+GPU Infer)... ", end="", flush=True)
+        print("  [Phase 1] Simulation (CPU+GPU Infer)... \n", end="", flush=True)
         t_sim_start = time.time()
         
         processes = []
@@ -370,7 +383,7 @@ def train_self_play(total_episodes=200000, batch_size=2048, val_path='tf_value_m
         gpu_inference_server(parent_conns, fast_val_infer, fast_pol_infer)
         
         d_sim = time.time() - t_sim_start
-        print(f"Done in {d_sim:.2f}s", flush=True)
+        print(f"\n  Done in {d_sim:.2f}s", flush=True)
         
         print("  [Phase 2] Buffer Collection...          ", end="", flush=True)
         t_col_start = time.time()
@@ -443,4 +456,5 @@ def train_self_play(total_episodes=200000, batch_size=2048, val_path='tf_value_m
 
 if __name__ == "__main__":
     mp.freeze_support()
-    train_self_play(total_episodes=50000, episodes_per_update=50, batch_size=2048, threads_per_worker=10)
+    # Increase threads_per_worker to 16 for better L4 saturation
+    train_self_play(total_episodes=50000, episodes_per_update=50, batch_size=2048, threads_per_worker=32)
