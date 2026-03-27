@@ -100,12 +100,13 @@ class ExpertNode:
         return self.score_sum / self.visit_count if self.visit_count > 0 else 0
 
 class ExpertBlokusBot:
-    def __init__(self, name="ExpertZero", model=None, pipe=None, shared_data=None, is_training=False):
+    def __init__(self, name="ExpertZero", model=None, pipe=None, shared_data=None, is_training=False, virtual_threads=16):
         self.name = name
         self.model = model
         self.pipe = pipe
         self.shared_data = shared_data
         self.is_training = is_training
+        self.virtual_threads = virtual_threads
         self.c_puct = 1.5
         self.score_utility_weight = 0.02 
         
@@ -122,8 +123,8 @@ class ExpertBlokusBot:
 
     def get_action(self, state_tensor, legal_moves, is_training=True, fast_playout=False):
         num_simulations = 20 if fast_playout else 200
-        VIRTUAL_THREADS = 16 
-        
+        virtual_threads = int(num_simulations * 0.4) ###
+
         root = ExpertNode(1.0)
         
         if is_training:
@@ -140,7 +141,7 @@ class ExpertBlokusBot:
             paths_to_eval = []
             states_to_eval = []
             
-            for _ in range(VIRTUAL_THREADS):
+            for _ in range(virtual_threads): ###
                 if sims_completed >= num_simulations: break
                 
                 node = root

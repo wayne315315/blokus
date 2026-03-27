@@ -9,7 +9,7 @@ import tensorflow as tf
 from tf_alphazero_bot import AdvancedBlokusModel, ExpertBlokusBot
 from helper import BOARD_SIZE, SHAPES
 
-VIRTUAL_THREADS = 32 # KataGo thread multiplier
+VIRTUAL_THREADS = 256 # KataGo thread multiplier
 
 def generate_expert_game(bot):
     states, policies, players = [], [], []
@@ -69,7 +69,7 @@ def distributed_train_worker(num_games, conn, result_queue, worker_idx, shared_c
     shared_scores = np.ctypeslib.as_array(shared_data_bases[3].get_obj()).reshape((num_workers, VIRTUAL_THREADS))
     
     shared_data = (worker_idx, shared_states, shared_policies, shared_values, shared_scores)
-    bot = ExpertBlokusBot(pipe=conn, shared_data=shared_data, is_training=True)
+    bot = ExpertBlokusBot(pipe=conn, shared_data=shared_data, is_training=True, virtual_threads=VIRTUAL_THREADS)
     
     S, P, V, SC, O = [], [], [], [], []
     for _ in range(num_games):
@@ -99,8 +99,8 @@ def training_inference_server(conns, model, shared_counter, total_games, shared_
     total_states_queued = 0
     last_fire_time = time.time()
 
-    MIN_BATCH_SIZE = 128 
-    MAX_WAIT_TIME = 0.015 
+    MIN_BATCH_SIZE = 1024 
+    MAX_WAIT_TIME = 0.01
 
     while active_conns:
         readable = multiprocessing.connection.wait(active_conns, timeout=0.002)
@@ -162,7 +162,7 @@ def run_training_pipeline():
 
     adv_model = AdvancedBlokusModel()
     
-    TOTAL_GAMES_PER_ITERATION = 124
+    TOTAL_GAMES_PER_ITERATION = 128 
     num_workers = 31 # Perfectly maps your 32-thread CPU
     games_per_worker = max(1, TOTAL_GAMES_PER_ITERATION // num_workers)
     actual_total_games = num_workers * games_per_worker
@@ -214,7 +214,6 @@ def run_training_pipeline():
             epochs=2
         )
         
-        adv_model.model.save(f"blokus_expert_v{iteration}.keras")
         adv_model.model.save("blokus_expert_v0.keras") 
         tf.keras.backend.clear_session()
 
