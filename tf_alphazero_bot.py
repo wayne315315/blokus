@@ -1,6 +1,4 @@
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras import layers, models
 import math
 
 from helper import BOARD_SIZE, SHAPES, is_valid_move, rotate_shape, flip_shape
@@ -14,6 +12,10 @@ class AdvancedBlokusModel:
         self.model = self.build_unified_model()
 
     def build_unified_model(self):
+        # LAZY IMPORT: Protects CPU RAM
+        import tensorflow as tf
+        from tensorflow.keras import layers, models
+
         inputs = layers.Input(shape=(self.board_size, self.board_size, 6))
 
         x = layers.Conv2D(self.filters, 3, padding='same', use_bias=False)(inputs)
@@ -88,7 +90,6 @@ class ExpertNode:
         self.visit_count = 0
         self.value_sum = 0.0
         self.score_sum = 0.0
-        
         self.virtual_loss = 0.0 
         self.is_evaluating = False 
 
@@ -100,13 +101,12 @@ class ExpertNode:
         return self.score_sum / self.visit_count if self.visit_count > 0 else 0
 
 class ExpertBlokusBot:
-    def __init__(self, name="ExpertZero", model=None, pipe=None, shared_data=None, is_training=False, virtual_threads=16):
+    def __init__(self, name="ExpertZero", model=None, pipe=None, shared_data=None, is_training=False):
         self.name = name
         self.model = model
         self.pipe = pipe
         self.shared_data = shared_data
         self.is_training = is_training
-        self.virtual_threads = virtual_threads
         self.c_puct = 1.5
         self.score_utility_weight = 0.02 
         
@@ -122,26 +122,42 @@ class ExpertBlokusBot:
         return self._decode_action(action, legal_moves)
 
     def get_action(self, state_tensor, legal_moves, is_training=True, fast_playout=False):
-        num_simulations = 20 if fast_playout else 200
-        virtual_threads = int(num_simulations * 0.4) ###
+        num_simulations = 40 if fast_playout else 400
+        virtual_threads = num_simulations // 4
+        # 🛑 ROOT NODE FIX: Extract the real neural network policy before building the tree
+        if self.shared_data:
+            w_id, s_states, s_policies, s_values, s_scores = self.shared_data
+            s_states[w_id, 0] = state_tensor
+            self.pipe.send(1) 
+            self.pipe.recv()     
+            root_policy = s_policies[w_id, 0].copy()
+        elif self.pipe:
+            self.pipe.send(np.array([state_tensor]))
+            root_policy, _, _, _ = self.pipe.recv()
+            root_policy = root_policy[0]
+        else:
+            import tensorflow as tf
+            preds = self.model.predict(np.array([state_tensor]), verbose=0)
+            root_policy = preds[0][0]
 
         root = ExpertNode(1.0)
         
+        # 🛑 INJECT REAL KNOWLEDGE: Replaces the blind 1.0/len(legal_moves) logic
         if is_training:
             noise = np.random.dirichlet([0.03] * len(legal_moves))
             for action, n in zip(legal_moves, noise):
-                prob = 0.75 * (1.0/len(legal_moves)) + 0.25 * n
+                prob = 0.75 * root_policy[action[0]] + 0.25 * n
                 root.children[action] = ExpertNode(prior=prob, parent=root, action_id=action[0])
         else:
             for action in legal_moves:
-                root.children[action] = ExpertNode(prior=1.0/len(legal_moves), parent=root, action_id=action[0])
+                root.children[action] = ExpertNode(prior=root_policy[action[0]], parent=root, action_id=action[0])
 
         sims_completed = 0
         while sims_completed < num_simulations:
             paths_to_eval = []
             states_to_eval = []
             
-            for _ in range(virtual_threads): ###
+            for _ in range(virtual_threads):
                 if sims_completed >= num_simulations: break
                 
                 node = root
@@ -156,8 +172,6 @@ class ExpertBlokusBot:
                     
                     for action, child in node.children.items():
                         q = child.q_value() + (self.score_utility_weight * child.q_score())
-                        
-                        # Added math.sqrt safety
                         u = self.c_puct * child.prior * math.sqrt(max(0, node.visit_count)) / (1 + child.visit_count)
                         if q + u > best_score:
                             best_score, best_child = q + u, child
@@ -166,7 +180,6 @@ class ExpertBlokusBot:
                     path.append(node)
                     
                 if node.is_evaluating:
-                    # 🚀 CRITICAL BUG FIX: Roll back ONLY path[:-1] to prevent negative visits on leaves
                     for n in path[:-1]:
                         n.virtual_loss = max(0.0, n.virtual_loss - 1.0)
                         n.visit_count = max(0, n.visit_count - 1)
@@ -180,8 +193,7 @@ class ExpertBlokusBot:
                 states_to_eval.append(state_tensor) 
                 sims_completed += 1
                 
-            if not paths_to_eval:
-                break # Failsafe to prevent zero-batch locks
+            if not paths_to_eval: break 
                 
             batch_size = len(states_to_eval)
             if self.shared_data:
@@ -192,14 +204,17 @@ class ExpertBlokusBot:
                 policies = s_policies[w_id, :batch_size].copy()
                 values = s_values[w_id, :batch_size].copy()
                 score_leads = s_scores[w_id, :batch_size].copy()
+            elif self.pipe:
+                self.pipe.send(np.array(states_to_eval))
+                policies, values, score_leads, _ = self.pipe.recv()
             else:
+                import tensorflow as tf
                 preds = self.model.predict(np.array(states_to_eval), verbose=0)
                 policies, values, score_leads = preds[0], preds[1].flatten(), preds[2].flatten()
             
             for i, path in enumerate(paths_to_eval):
                 leaf = path[-1]
                 policy, value, score_lead = policies[i], float(values[i]), float(score_leads[i])
-                
                 leaf.is_evaluating = False
                 
                 for action in legal_moves:
@@ -207,21 +222,17 @@ class ExpertBlokusBot:
                     leaf.children[action] = ExpertNode(prior=policy[action_id], parent=leaf, action_id=action_id)
                 
                 for node in reversed(path):
-                    # Added max(0) safety floors
                     node.virtual_loss = max(0.0, node.virtual_loss - 1.0) 
                     node.value_sum += value  
                     node.score_sum += score_lead
                     value, score_lead = -value, -score_lead 
 
-        # Build policy outputs with positive safeguards
         visits = [max(0, root.children[a].visit_count) if a in root.children else 0 for a in legal_moves]
         if is_training:
             visits = np.array(visits) ** (1.0 / 1.0)
             sum_visits = np.sum(visits)
-            if sum_visits > 0:
-                pi_probs = visits / sum_visits
-            else:
-                pi_probs = np.ones(len(legal_moves)) / len(legal_moves)
+            if sum_visits > 0: pi_probs = visits / sum_visits
+            else: pi_probs = np.ones(len(legal_moves)) / len(legal_moves)
             chosen_idx = np.random.choice(len(legal_moves), p=pi_probs)
         else:
             chosen_idx = np.argmax(visits)
@@ -230,7 +241,6 @@ class ExpertBlokusBot:
 
         full_pi = np.zeros(self.policy_dim)
         for idx, action in enumerate(legal_moves): full_pi[action[0]] = pi_probs[idx]
-
         return legal_moves[chosen_idx], full_pi
 
     def _build_state_tensor(self, board, color, inventories, first_moves):

@@ -8,7 +8,8 @@ import numpy as np
 from helper import BOARD_SIZE, SHAPES
 from player import BotPlayer  
 
-MAX_CAPACITY = 1024
+# 🛑 OVERSIZED BUFFER FIX: We allocate a massive 256-slot buffer per worker.
+MAX_CAPACITY = 256 
 
 def play_test_game(adv_bot, std_bot_1, std_bot_2, play_as_first):
     board = [[0 for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
@@ -79,7 +80,6 @@ def distributed_test_worker(num_games, conn, result_queue, worker_idx, shared_co
         aw, sw, t, diff = play_test_game(adv_bot, std_bot_1, std_bot_2, play_as_first)
         az_wins += aw; std_wins += sw; ties += t; az_score_diff += diff
         
-        # Increment the shared counter so the server knows exactly how many games are done
         with shared_counter.get_lock():
             shared_counter.value += 1
 
@@ -99,7 +99,7 @@ def test_inference_server(conns, fast_infer, shared_counter, total_games, shared
     total_states_queued = 0
     last_fire_time = time.time()
 
-    MIN_BATCH_SIZE = 128 
+    MIN_BATCH_SIZE = 1024
     MAX_WAIT_TIME = 0.05 
 
     while active_conns:
@@ -150,17 +150,14 @@ def test_model(num_games=100):
     print(f"DISTRIBUTED TENSORFLOW BENCHMARK (BLOKUS - {num_games} GAMES)")
     print("="*60)
     
-    keras_path = "blokus_expert_v0.keras"
-    if not os.path.exists(keras_path):
-        print(f"❌ Waiting for train_alphazero.py to output {keras_path} first.")
-        return
+    keras_path = "blokus_expert_latest.keras"
 
     import tensorflow as tf
 
     gpus = tf.config.list_physical_devices('GPU')
     if gpus: tf.config.experimental.set_memory_growth(gpus[0], True)
 
-    print("Warming up TensorFlow Graph Compiler...")
+    print(f"Warming up TensorFlow Graph Compiler for {keras_path}...")
     model = tf.keras.models.load_model(keras_path, compile=False)
     
     @tf.function(reduce_retracing=True)
@@ -169,13 +166,12 @@ def test_model(num_games=100):
 
     _ = fast_infer(tf.zeros((64, 20, 20, 6), dtype=tf.float32))
     
-    num_workers = min(31, mp.cpu_count() - 1) 
+    num_workers = mp.cpu_count() - 1 if mp.cpu_count() > 1 else 1 
     print(f"Starting {num_workers} CPU Process Workers...")
     
     start_time = time.time()
     ctx = mp.get_context('spawn')
     
-    # Shared counter for real-time tracking
     shared_counter = ctx.Value('i', 0)
     
     shared_states_base = mp.Array(ctypes.c_float, num_workers * MAX_CAPACITY * 20 * 20 * 6)
