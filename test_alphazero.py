@@ -8,9 +8,10 @@ import numpy as np
 from helper import BOARD_SIZE, SHAPES
 from player import BotPlayer  
 
+MAX_ORDER = 10
 _NUM_CPUS = mp.cpu_count()
 NUM_WORKERS = min(31, _NUM_CPUS - 1 if _NUM_CPUS > 1 else 1)
-MAX_CAPACITY = 8192
+MAX_CAPACITY = 2048
 
 def play_test_game(adv_bot, std_bot_1, std_bot_2, play_as_first):
     board = [[0 for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
@@ -96,7 +97,7 @@ def test_inference_server(conns, fast_infer, shared_counter, total_games, shared
     total_states_queued = 0
     last_print_time = time.time()
     
-    CHUNK_SIZE = 512
+    CHUNK_SIZE = 2 ** MAX_ORDER
 
     print("🔥 Allocating Static Server Buffer in System RAM...", flush=True)
     MAX_POSSIBLE_BATCH = num_workers * MAX_CAPACITY
@@ -131,20 +132,25 @@ def test_inference_server(conns, fast_infer, shared_counter, total_games, shared
             
             t1 = time.time()
             v_preds, sc_preds = [], []
-            for i in range(0, actual_size, CHUNK_SIZE):
-                chunk = batch_tensor[i : i + CHUNK_SIZE]
-                curr_size = chunk.shape[0]
-                
-                pad_target = 1 << (curr_size - 1).bit_length()
-                if curr_size < pad_target:
-                    pad = np.zeros((pad_target - curr_size, 20, 20, 6), dtype=np.float32)
-                    chunk_padded = np.concatenate([chunk, pad], axis=0)
+            
+            # 🚀 POWER-OF-2 DECOMPOSITION ALGORITHM
+            sizes = []
+            rem = actual_size
+            while rem > 0:
+                if rem >= CHUNK_SIZE:
+                    p = CHUNK_SIZE
                 else:
-                    chunk_padded = chunk
-                    
-                preds = fast_infer(chunk_padded)
-                v_preds.append(preds[0].numpy().flatten()[:curr_size])
-                sc_preds.append(preds[1].numpy().flatten()[:curr_size])
+                    p = 1 << (rem.bit_length() - 1)
+                sizes.append(p)
+                rem -= p
+                
+            tensor_cursor = 0
+            for p in sizes:
+                chunk = batch_tensor[tensor_cursor : tensor_cursor + p]
+                preds = fast_infer(chunk)
+                v_preds.append(preds[0].numpy().flatten())
+                sc_preds.append(preds[1].numpy().flatten())
+                tensor_cursor += p
                 
             t_infer = (time.time() - t1) * 1000 
             t_per_sample = (t_infer / actual_size) if actual_size > 0 else 0.0
@@ -199,9 +205,9 @@ def test_model(num_games=124):
     def fast_infer(batch_tensor): 
         return model(batch_tensor, training=False)
 
-    print("🔥 Pre-compiling Power-of-2 XLA Buckets (1 to 8192) into System RAM...")
-    for p in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]:
-        _ = fast_infer(tf.zeros((p, 20, 20, 6), dtype=tf.float32))
+    print(f"🔥 Pre-compiling Power-of-2 XLA Buckets (1 to {MAX_CAPACITY}) into System RAM...")
+    for o in range(MAX_ORDER + 1):
+        _ = fast_infer(tf.zeros((2 ** o, 20, 20, 6), dtype=tf.float32))
     print("✅ All dynamic graphs successfully compiled and cached!")
 
     print("="*60)

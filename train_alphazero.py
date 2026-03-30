@@ -8,12 +8,12 @@ import numpy as np
 
 from helper import BOARD_SIZE, SHAPES
 
+# 🛑 IMPORT ISOLATION: No global TensorFlow import here to save ~15GB of worker RAM!
+MAX_ORDER = 10
 _NUM_CPUS = mp.cpu_count()
 # 🛑 Pure Python Parallelism: 1 Process = 1 Game (No GIL Blocking!)
 NUM_WORKERS = min(31, _NUM_CPUS - 1 if _NUM_CPUS > 1 else 1)
-
-# Safe 2048 Limit for pure sequential MCTS
-MAX_CAPACITY = 2048 
+MAX_CAPACITY = 2048
 
 def generate_expert_game(bot):
     states, players = [], []
@@ -60,7 +60,6 @@ def generate_expert_game(bot):
 
     return states, val_targets, score_targets
 
-# 🛑 Notice how clean this signature is now! No more lists of connections.
 def distributed_train_worker(games_per_worker, conn, result_queue, worker_idx, shared_counter, shared_data_bases, num_workers):
     os.environ['CUDA_VISIBLE_DEVICES'] = '-1' 
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
@@ -94,7 +93,7 @@ def training_inference_server(conns, fast_infer, shared_counter, total_games, sh
     total_states_queued = 0
     last_print_time = time.time()
 
-    CHUNK_SIZE = 512 
+    CHUNK_SIZE =  2 ** MAX_ORDER
 
     print("🔥 Allocating Static Server Buffer in System RAM...", flush=True)
     MAX_POSSIBLE_BATCH = num_workers * MAX_CAPACITY
@@ -130,20 +129,25 @@ def training_inference_server(conns, fast_infer, shared_counter, total_games, sh
             
             t1 = time.time()
             v_preds, sc_preds = [], []
-            for i in range(0, actual_size, CHUNK_SIZE):
-                chunk = batch_tensor[i : i + CHUNK_SIZE]
-                curr_size = chunk.shape[0]
-                
-                pad_target = 1 << (curr_size - 1).bit_length()
-                if curr_size < pad_target:
-                    pad = np.zeros((pad_target - curr_size, 20, 20, 6), dtype=np.float32)
-                    chunk_padded = np.concatenate([chunk, pad], axis=0)
+            
+            # 🚀 POWER-OF-2 DECOMPOSITION ALGORITHM
+            sizes = []
+            rem = actual_size
+            while rem > 0:
+                if rem >= CHUNK_SIZE:
+                    p = CHUNK_SIZE
                 else:
-                    chunk_padded = chunk
-                    
-                preds = fast_infer(chunk_padded)
-                v_preds.append(preds[0].numpy().flatten()[:curr_size])
-                sc_preds.append(preds[1].numpy().flatten()[:curr_size])
+                    p = 1 << (rem.bit_length() - 1)
+                sizes.append(p)
+                rem -= p
+                
+            tensor_cursor = 0
+            for p in sizes:
+                chunk = batch_tensor[tensor_cursor : tensor_cursor + p]
+                preds = fast_infer(chunk)
+                v_preds.append(preds[0].numpy().flatten())
+                sc_preds.append(preds[1].numpy().flatten())
+                tensor_cursor += p
                 
             t_infer = (time.time() - t1) * 1000 
             t_per_sample = (t_infer / actual_size) if actual_size > 0 else 0.0
@@ -198,13 +202,13 @@ def run_training_pipeline(num_iteration=50):
     @tf.function(reduce_retracing=True)
     def fast_infer(batch_tensor): 
         return model(batch_tensor, training=False)
-    
-    print("🔥 Pre-compiling Power-of-2 XLA Buckets (1 to 2048) into System RAM...", flush=True)
-    for p in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]:
-        _ = fast_infer(tf.zeros((p, 20, 20, 6), dtype=tf.float32))
+
+    print(f"🔥 Pre-compiling Power-of-2 XLA Buckets (1 to {MAX_CAPACITY}) into System RAM...")
+    for o in range(MAX_ORDER + 1):
+        _ = fast_infer(tf.zeros((2 ** o, 20, 20, 6), dtype=tf.float32))
     print("✅ All dynamic graphs successfully compiled and cached!", flush=True)
     
-    TOTAL_GAMES_PER_ITERATION = 124 
+    TOTAL_GAMES_PER_ITERATION = 1000 
     games_per_worker = max(1, TOTAL_GAMES_PER_ITERATION // NUM_WORKERS)
     actual_total_games = NUM_WORKERS * games_per_worker
 
