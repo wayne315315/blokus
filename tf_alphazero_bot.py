@@ -8,11 +8,9 @@ class AdvancedBlokusModel:
         self.board_size = board_size
         self.num_blocks = num_blocks
         self.filters = filters
-        self.policy_dim = 21 * 8 * (board_size * board_size) 
         self.model = self.build_unified_model()
 
     def build_unified_model(self):
-        # LAZY IMPORT: Protects CPU RAM
         import tensorflow as tf
         from tensorflow.keras import layers, models
 
@@ -38,12 +36,8 @@ class AdvancedBlokusModel:
             x = layers.Add()([shortcut, x])
             x = layers.Activation('relu')(x)
 
-        p = layers.Conv2D(4, 1, padding='same', use_bias=False)(x)
-        p = layers.BatchNormalization()(p)
-        p = layers.Activation('relu')(p)
-        p = layers.Flatten()(p)
-        policy_out = layers.Dense(self.policy_dim, activation='softmax', name='policy')(p)
-
+        # 🛑 ARCHITECTURE REWRITE: The 67,200 Policy head is completely deleted! 
+        # The network now only acts as a Q-Value evaluator for After-States.
         v = layers.Conv2D(1, 1, padding='same', use_bias=False)(x)
         v = layers.BatchNormalization()(v)
         v = layers.Activation('relu')(v)
@@ -58,47 +52,38 @@ class AdvancedBlokusModel:
         s = layers.Dense(256, activation='relu')(s)
         score_out = layers.Dense(1, name='score_lead')(s)  
 
-        own = layers.Conv2D(5, 1, padding='same', name='ownership_conv')(x)
-        ownership_out = layers.Reshape((self.board_size, self.board_size, 5))(own)
-        ownership_out = layers.Softmax(axis=-1, name='ownership')(ownership_out)
-
-        model = models.Model(inputs=inputs, outputs=[policy_out, value_out, score_out, ownership_out])
+        model = models.Model(inputs=inputs, outputs=[value_out, score_out])
         
         model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-            loss={
-                'policy': 'categorical_crossentropy',
-                'value': 'mean_squared_error',
-                'score_lead': 'huber',  
-                'ownership': 'sparse_categorical_crossentropy' 
-            },
-            loss_weights={
-                'policy': 1.0,
-                'value': 1.0,
-                'score_lead': 0.05, 
-                'ownership': 0.05   
-            }
+            loss={'value': 'mean_squared_error', 'score_lead': 'huber'},
+            loss_weights={'value': 1.0, 'score_lead': 0.05}
         )
         return model
 
 class ExpertNode:
-    def __init__(self, prior, parent=None, action_id=None):
-        self.prior = prior
+    def __init__(self, board, current_color, inventories, first_moves, parent=None, action_id=None, prior=0.0, q_init=0.0):
+        self.board = board
+        self.current_color = current_color
+        self.inventories = inventories
+        self.first_moves = first_moves
+        
         self.parent = parent
         self.action_id = action_id 
+        self.prior = prior
         self.children = {}
+        
         self.visit_count = 0
         self.value_sum = 0.0
-        self.score_sum = 0.0
-        self.virtual_loss = 0.0 
-        self.is_evaluating = False 
+        self.q_init = q_init 
+
+    def is_expanded(self):
+        return len(self.children) > 0
 
     def q_value(self): 
-        if self.visit_count <= 0: return 0
-        return (self.value_sum - self.virtual_loss) / self.visit_count
-        
-    def q_score(self): 
-        return self.score_sum / self.visit_count if self.visit_count > 0 else 0
+        # If unvisited, return the exact Q-value predicted by the neural network's after-state!
+        if self.visit_count == 0: return self.q_init
+        return self.value_sum / self.visit_count
 
 class ExpertBlokusBot:
     def __init__(self, name="ExpertZero", model=None, pipe=None, shared_data=None, is_training=False):
@@ -108,140 +93,127 @@ class ExpertBlokusBot:
         self.shared_data = shared_data
         self.is_training = is_training
         self.c_puct = 1.5
-        self.score_utility_weight = 0.02 
-        
-        self.policy_dim = 21 * 8 * (BOARD_SIZE * BOARD_SIZE) 
+
         self.shape_keys = list(SHAPES.keys())
         self.shape_to_id = {name: idx for idx, name in enumerate(self.shape_keys)}
 
     def get_play(self, board, color, inventories, first_moves, pass_count):
-        state_tensor = self._build_state_tensor(board, color, inventories, first_moves)
         legal_moves = self._get_legal_moves(board, color, inventories, first_moves)
         if not legal_moves: return None, []
-        action, _ = self.get_action(state_tensor, legal_moves, self.is_training)
+        action = self.get_action(board, color, inventories, first_moves, legal_moves, self.is_training)
         return self._decode_action(action, legal_moves)
 
-    def get_action(self, state_tensor, legal_moves, is_training=True, fast_playout=False):
-        num_simulations = 40 if fast_playout else 400
-        virtual_threads = num_simulations // 4
-        # 🛑 ROOT NODE FIX: Extract the real neural network policy before building the tree
-        if self.shared_data:
-            w_id, s_states, s_policies, s_values, s_scores = self.shared_data
-            s_states[w_id, 0] = state_tensor
-            self.pipe.send(1) 
-            self.pipe.recv()     
-            root_policy = s_policies[w_id, 0].copy()
-        elif self.pipe:
-            self.pipe.send(np.array([state_tensor]))
-            root_policy, _, _, _ = self.pipe.recv()
-            root_policy = root_policy[0]
-        else:
-            import tensorflow as tf
-            preds = self.model.predict(np.array([state_tensor]), verbose=0)
-            root_policy = preds[0][0]
-
-        root = ExpertNode(1.0)
+    def get_action(self, board, color, inventories, first_moves, legal_moves, is_training=True, fast_playout=False):
+        # 🛑 AFTER-STATE MCTS: Because evaluating 1 node now evaluates ALL its after-states natively, 
+        # we require vastly fewer simulations to achieve superhuman depth.
+        num_simulations = 6 if fast_playout else 25
         
-        # 🛑 INJECT REAL KNOWLEDGE: Replaces the blind 1.0/len(legal_moves) logic
-        if is_training:
-            noise = np.random.dirichlet([0.03] * len(legal_moves))
-            for action, n in zip(legal_moves, noise):
-                prob = 0.75 * root_policy[action[0]] + 0.25 * n
-                root.children[action] = ExpertNode(prior=prob, parent=root, action_id=action[0])
-        else:
-            for action in legal_moves:
-                root.children[action] = ExpertNode(prior=root_policy[action[0]], parent=root, action_id=action[0])
+        root = ExpertNode(board, color, inventories, first_moves)
+        self._expand_and_evaluate(root, legal_moves)
 
-        sims_completed = 0
-        while sims_completed < num_simulations:
-            paths_to_eval = []
-            states_to_eval = []
+        if is_training:
+            noise = np.random.dirichlet([0.05] * len(legal_moves))
+            for i, child in enumerate(root.children.values()):
+                child.prior = 0.75 * child.prior + 0.25 * noise[i]
+
+        for _ in range(num_simulations):
+            node = root
+            search_path = [node]
             
-            for _ in range(virtual_threads):
-                if sims_completed >= num_simulations: break
+            # Selection Phase
+            while node.is_expanded():
+                best_score = -float('inf')
+                best_child = None
+                for child in node.children.values():
+                    q = child.q_value() 
+                    u = self.c_puct * child.prior * math.sqrt(max(1, node.visit_count)) / (1 + child.visit_count)
+                    if q + u > best_score:
+                        best_score, best_child = q + u, child
+                node = best_child
+                search_path.append(node)
                 
-                node = root
-                path = [node]
-                
-                while len(node.children) > 0:
-                    node.virtual_loss += 1.0 
-                    node.visit_count += 1
-                    
-                    best_score = -float('inf')
-                    best_child = None
-                    
-                    for action, child in node.children.items():
-                        q = child.q_value() + (self.score_utility_weight * child.q_score())
-                        u = self.c_puct * child.prior * math.sqrt(max(0, node.visit_count)) / (1 + child.visit_count)
-                        if q + u > best_score:
-                            best_score, best_child = q + u, child
-                    
-                    node = best_child
-                    path.append(node)
-                    
-                if node.is_evaluating:
-                    for n in path[:-1]:
-                        n.virtual_loss = max(0.0, n.virtual_loss - 1.0)
-                        n.visit_count = max(0, n.visit_count - 1)
-                    continue 
-                    
-                node.is_evaluating = True
-                node.virtual_loss += 1.0
-                node.visit_count += 1
-                
-                paths_to_eval.append(path)
-                states_to_eval.append(state_tensor) 
-                sims_completed += 1
-                
-            if not paths_to_eval: break 
-                
-            batch_size = len(states_to_eval)
-            if self.shared_data:
-                w_id, s_states, s_policies, s_values, s_scores = self.shared_data
-                s_states[w_id, :batch_size] = states_to_eval
-                self.pipe.send(batch_size) 
-                self.pipe.recv()     
-                policies = s_policies[w_id, :batch_size].copy()
-                values = s_values[w_id, :batch_size].copy()
-                score_leads = s_scores[w_id, :batch_size].copy()
-            elif self.pipe:
-                self.pipe.send(np.array(states_to_eval))
-                policies, values, score_leads, _ = self.pipe.recv()
+            # Expansion Phase
+            node_legal_moves = self._get_legal_moves(node.board, node.current_color, node.inventories, node.first_moves)
+            if node_legal_moves:
+                v_leaf = self._expand_and_evaluate(node, node_legal_moves)
             else:
-                import tensorflow as tf
-                preds = self.model.predict(np.array(states_to_eval), verbose=0)
-                policies, values, score_leads = preds[0], preds[1].flatten(), preds[2].flatten()
-            
-            for i, path in enumerate(paths_to_eval):
-                leaf = path[-1]
-                policy, value, score_lead = policies[i], float(values[i]), float(score_leads[i])
-                leaf.is_evaluating = False
-                
-                for action in legal_moves:
-                    action_id = action[0]
-                    leaf.children[action] = ExpertNode(prior=policy[action_id], parent=leaf, action_id=action_id)
-                
-                for node in reversed(path):
-                    node.virtual_loss = max(0.0, node.virtual_loss - 1.0) 
-                    node.value_sum += value  
-                    node.score_sum += score_lead
-                    value, score_lead = -value, -score_lead 
+                v_leaf = node.q_value() # Terminal/Pass
 
-        visits = [max(0, root.children[a].visit_count) if a in root.children else 0 for a in legal_moves]
+            # Backpropagation Phase
+            for n in reversed(search_path):
+                n.visit_count += 1
+                n.value_sum += v_leaf
+
+        visits = [root.children[a].visit_count for a in legal_moves]
         if is_training:
-            visits = np.array(visits) ** (1.0 / 1.0)
-            sum_visits = np.sum(visits)
-            if sum_visits > 0: pi_probs = visits / sum_visits
-            else: pi_probs = np.ones(len(legal_moves)) / len(legal_moves)
+            sum_visits = sum(visits)
+            pi_probs = [v / sum_visits for v in visits] if sum_visits > 0 else [1.0/len(legal_moves)] * len(legal_moves)
             chosen_idx = np.random.choice(len(legal_moves), p=pi_probs)
         else:
             chosen_idx = np.argmax(visits)
-            pi_probs = np.zeros(len(legal_moves))
-            pi_probs[chosen_idx] = 1.0
 
-        full_pi = np.zeros(self.policy_dim)
-        for idx, action in enumerate(legal_moves): full_pi[action[0]] = pi_probs[idx]
-        return legal_moves[chosen_idx], full_pi
+        return legal_moves[chosen_idx]
+
+    def _expand_and_evaluate(self, node, legal_moves):
+        """Generates all After-States for the legal moves, evaluates them in a batch, and creates children."""
+        after_states = []
+        for action in legal_moves:
+            shape_name, coords = action[1], action[5]
+            
+            next_board = [row[:] for row in node.board]
+            for r, c in coords: next_board[r][c] = node.current_color
+                
+            next_inv = {k: list(v) for k, v in node.inventories.items()}
+            next_inv[node.current_color].remove(shape_name)
+            
+            next_first = dict(node.first_moves)
+            next_first[node.current_color] = False
+            next_color = (node.current_color % 4) + 1
+            
+            astate = self._build_state_tensor(next_board, next_color, next_inv, next_first)
+            after_states.append(astate)
+            
+        batch_size = len(after_states)
+        
+        # 🛑 Send the After-States directly to the GPU to evaluate their Q-Values
+        if self.shared_data:
+            w_id, s_states, s_values, s_scores = self.shared_data
+            s_states[w_id, :batch_size] = after_states
+            self.pipe.send(batch_size) 
+            self.pipe.recv()     
+            values = s_values[w_id, :batch_size].copy()
+        else:
+            import tensorflow as tf
+            preds = self.model.predict(np.array(after_states), verbose=0)
+            values = preds[0].flatten()
+
+        next_color = (node.current_color % 4) + 1
+        is_enemy = (node.current_color % 2) != (next_color % 2)
+        
+        q_values = np.zeros(batch_size)
+        for i in range(batch_size):
+            # If the after-state is the enemy's turn, a high value for them is a negative Q-value for us!
+            q_values[i] = -values[i] if is_enemy else values[i]
+            
+        # Convert Q-values to Softmax Policy Priors
+        temperature = 0.25 if self.is_training else 0.1
+        exp_q = np.exp((q_values - np.max(q_values)) / temperature)
+        priors = exp_q / np.sum(exp_q)
+
+        for i, action in enumerate(legal_moves):
+            child_board = [row[:] for row in node.board]
+            for r, c in action[5]: child_board[r][c] = node.current_color
+            child_inv = {k: list(v) for k, v in node.inventories.items()}
+            child_inv[node.current_color].remove(action[1])
+            child_first = dict(node.first_moves)
+            child_first[node.current_color] = False
+            
+            node.children[action] = ExpertNode(
+                board=child_board, current_color=next_color, inventories=child_inv, first_moves=child_first,
+                parent=node, action_id=action[0], prior=priors[i], q_init=q_values[i]
+            )
+            
+        return np.max(q_values) 
 
     def _build_state_tensor(self, board, color, inventories, first_moves):
         tensor = np.zeros((BOARD_SIZE, BOARD_SIZE, 6), dtype=np.float32)
@@ -255,9 +227,39 @@ class ExpertBlokusBot:
         legal_moves = []
         is_first = first_moves[color]
         my_shapes = inventories.get(color, inventories.get(str(color), []))
+        if not my_shapes: return []
+        
+        board_np = np.array(board, dtype=int)
+        
+        if is_first:
+            corner_mask = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=bool)
+            if color == 1: corner_mask[0, 0] = True
+            elif color == 2: corner_mask[0, 19] = True
+            elif color == 3: corner_mask[19, 19] = True
+            elif color == 4: corner_mask[19, 0] = True
+            forbidden_mask = (board_np != 0)
+        else:
+            color_mask = (board_np == color)
+            up = np.zeros_like(color_mask); up[:-1, :] = color_mask[1:, :]
+            down = np.zeros_like(color_mask); down[1:, :] = color_mask[:-1, :]
+            left = np.zeros_like(color_mask); left[:, :-1] = color_mask[:, 1:]
+            right = np.zeros_like(color_mask); right[:, 1:] = color_mask[:, :-1]
+            forbidden_mask = up | down | left | right | (board_np != 0)
+            
+            ul = np.zeros_like(color_mask); ul[:-1, :-1] = color_mask[1:, 1:]
+            ur = np.zeros_like(color_mask); ur[:-1, 1:] = color_mask[1:, :-1]
+            dl = np.zeros_like(color_mask); dl[1:, :-1] = color_mask[:-1, 1:]
+            dr = np.zeros_like(color_mask); dr[1:, 1:] = color_mask[:-1, :-1]
+            corner_mask = (ul | ur | dl | dr) & (~forbidden_mask)
+            
+        valid_corners = np.argwhere(corner_mask)
+        if len(valid_corners) == 0: return []
+
+        seen_moves = set()
         for shape_name in my_shapes:
             shape_idx = self.shape_to_id[shape_name]
             base_shape = SHAPES[shape_name]
+            
             transforms = []
             seen_hashes = set()
             orient_id = 0
@@ -265,21 +267,38 @@ class ExpertBlokusBot:
                 curr_shape = base_shape if not flip else flip_shape(base_shape)
                 for rot in range(4):
                     if rot > 0: curr_shape = rotate_shape(curr_shape)
-                    min_r = min(r for r, c in curr_shape)
-                    min_c = min(c for r, c in curr_shape)
+                    min_r, min_c = min(r for r, c in curr_shape), min(c for r, c in curr_shape)
                     norm_shape = tuple(sorted((r - min_r, c - min_c) for r, c in curr_shape))
                     if norm_shape not in seen_hashes:
                         seen_hashes.add(norm_shape)
                         transforms.append((orient_id, norm_shape))
                     orient_id += 1
+                    
             for orient_idx, shape_coords in transforms:
-                max_r, max_c = max(r for r, c in shape_coords), max(c for r, c in shape_coords)
-                for r in range(BOARD_SIZE - max_r):
-                    for c in range(BOARD_SIZE - max_c):
-                        shifted_coords = [(r + sr, c + sc) for sr, sc in shape_coords]
-                        if is_valid_move(board, color, shifted_coords, is_first):
+                max_r = max(r for r, c in shape_coords)
+                max_c = max(c for r, c in shape_coords)
+                for cr, cc in valid_corners:
+                    for br, bc in shape_coords:
+                        r, c = cr - br, cc - bc
+                        if r < 0 or c < 0 or r + max_r >= BOARD_SIZE or c + max_c >= BOARD_SIZE: continue
+                            
+                        move_hash = (shape_idx, orient_idx, r, c)
+                        if move_hash in seen_moves: continue
+                        seen_moves.add(move_hash)
+                        
+                        valid = False
+                        for sr, sc in shape_coords:
+                            tr, tc = r + sr, c + sc
+                            if forbidden_mask[tr, tc]:
+                                valid = False
+                                break
+                            if corner_mask[tr, tc]: valid = True
+                        
+                        if valid:
                             action_id = (shape_idx * 8 * 400) + (orient_idx * 400) + (r * 20) + c
-                            legal_moves.append((action_id, shape_name, orient_idx, r, c, tuple(shifted_coords)))
+                            shifted = tuple((r + sr, c + sc) for sr, sc in shape_coords)
+                            legal_moves.append((action_id, shape_name, orient_idx, r, c, shifted))
+                            
         return legal_moves
 
     def _decode_action(self, action, legal_moves):

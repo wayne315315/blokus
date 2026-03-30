@@ -4,12 +4,12 @@ import multiprocessing as mp
 import multiprocessing.connection 
 import ctypes
 import numpy as np
+import tensorflow as tf
 
 from helper import BOARD_SIZE, SHAPES
 from player import BotPlayer  
 
-# 🛑 OVERSIZED BUFFER FIX: We allocate a massive 256-slot buffer per worker.
-MAX_CAPACITY = 256 
+MAX_CAPACITY = 2048 
 
 def play_test_game(adv_bot, std_bot_1, std_bot_2, play_as_first):
     board = [[0 for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
@@ -64,11 +64,10 @@ def distributed_test_worker(num_games, conn, result_queue, worker_idx, shared_co
     from tf_alphazero_bot import ExpertBlokusBot
     
     shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((num_workers, MAX_CAPACITY, 20, 20, 6))
-    shared_policies = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((num_workers, MAX_CAPACITY, 67200))
-    shared_values = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((num_workers, MAX_CAPACITY))
-    shared_scores = np.ctypeslib.as_array(shared_data_bases[3].get_obj()).reshape((num_workers, MAX_CAPACITY))
+    shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((num_workers, MAX_CAPACITY))
+    shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((num_workers, MAX_CAPACITY))
     
-    shared_data = (worker_idx, shared_states, shared_policies, shared_values, shared_scores)
+    shared_data = (worker_idx, shared_states, shared_values, shared_scores)
     
     adv_bot = ExpertBlokusBot(pipe=conn, shared_data=shared_data, is_training=False)
     std_bot_1 = BotPlayer() 
@@ -88,9 +87,8 @@ def distributed_test_worker(num_games, conn, result_queue, worker_idx, shared_co
 
 def test_inference_server(conns, fast_infer, shared_counter, total_games, shared_data_bases, num_workers):
     shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((num_workers, MAX_CAPACITY, 20, 20, 6))
-    shared_policies = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((num_workers, MAX_CAPACITY, 67200))
-    shared_values = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((num_workers, MAX_CAPACITY))
-    shared_scores = np.ctypeslib.as_array(shared_data_bases[3].get_obj()).reshape((num_workers, MAX_CAPACITY))
+    shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((num_workers, MAX_CAPACITY))
+    shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((num_workers, MAX_CAPACITY))
 
     active_conns = list(conns)
     conn_to_id = {conns[i]: i for i in range(num_workers)}
@@ -99,8 +97,9 @@ def test_inference_server(conns, fast_infer, shared_counter, total_games, shared
     total_states_queued = 0
     last_fire_time = time.time()
 
-    MIN_BATCH_SIZE = 1024
+    MIN_BATCH_SIZE = 1024 
     MAX_WAIT_TIME = 0.05 
+    CHUNK_SIZE = 2048 
 
     while active_conns:
         readable = multiprocessing.connection.wait(active_conns, timeout=0.002)
@@ -122,20 +121,39 @@ def test_inference_server(conns, fast_infer, shared_counter, total_games, shared
             
             flat_states = [shared_states[w_id, :size] for w_id, size in zip(ready_indices, batch_sizes)]
             batch_tensor = np.concatenate(flat_states, axis=0)
+            actual_size = batch_tensor.shape[0]
             
-            preds = fast_infer(batch_tensor)
-            p_numpy, v_numpy, sc_numpy = preds[0].numpy(), preds[1].numpy().flatten(), preds[2].numpy().flatten()
+            v_preds, sc_preds = [], []
+            
+            for i in range(0, actual_size, CHUNK_SIZE):
+                chunk = batch_tensor[i : i + CHUNK_SIZE]
+                curr_size = chunk.shape[0]
+                
+                # 🚀 DYNAMIC BUCKETING
+                pad_target = 1 << (curr_size - 1).bit_length()
+                
+                if curr_size < pad_target:
+                    pad = np.zeros((pad_target - curr_size, 20, 20, 6), dtype=np.float32)
+                    chunk_padded = np.concatenate([chunk, pad], axis=0)
+                else:
+                    chunk_padded = chunk
+                    
+                preds = fast_infer(chunk_padded)
+                
+                v_preds.append(preds[0].numpy().flatten()[:curr_size])
+                sc_preds.append(preds[1].numpy().flatten()[:curr_size])
+                
+            v_numpy = np.concatenate(v_preds)
+            sc_numpy = np.concatenate(sc_preds)
             
             cursor = 0
             for w_id, size in zip(ready_indices, batch_sizes):
-                shared_policies[w_id, :size] = p_numpy[cursor:cursor+size]
                 shared_values[w_id, :size] = v_numpy[cursor:cursor+size]
                 shared_scores[w_id, :size] = sc_numpy[cursor:cursor+size]
                 cursor += size
 
-            # 🛑 REAL-TIME MONITORING PRINT
             games_remaining = total_games - shared_counter.value
-            print(f"⚡ GPU INFERENCE | Batch Size: {total_states_queued:<4} | Games Remaining: {games_remaining:<4} ", end='\r', flush=True)
+            print(f"⚡ GPU INFERENCE | States Evaluated: {total_states_queued:<4} | Games Remaining: {games_remaining:<4} ", end='\r', flush=True)
 
             for pipe in ready_pipes: pipe.send(True)
 
@@ -151,8 +169,13 @@ def test_model(num_games=100):
     print("="*60)
     
     keras_path = "blokus_expert_latest.keras"
-
-    import tensorflow as tf
+    if not os.path.exists(keras_path):
+        fallback = "blokus_expert_v18.keras"
+        if os.path.exists(fallback): keras_path = fallback
+        elif os.path.exists("blokus_expert_v0.keras"): keras_path = "blokus_expert_v0.keras"
+        else:
+            print(f"❌ Waiting for train_alphazero.py to output a model first.")
+            return
 
     gpus = tf.config.list_physical_devices('GPU')
     if gpus: tf.config.experimental.set_memory_growth(gpus[0], True)
@@ -164,9 +187,12 @@ def test_model(num_games=100):
     def fast_infer(batch_tensor): 
         return model(batch_tensor, training=False)
 
-    _ = fast_infer(tf.zeros((64, 20, 20, 6), dtype=tf.float32))
+    print("🔥 Pre-compiling Power-of-2 XLA Buckets (1, 2, 4... 2048) into System RAM...")
+    for p in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]:
+        _ = fast_infer(tf.zeros((p, 20, 20, 6), dtype=tf.float32))
+    print("✅ All 12 dynamic graphs successfully compiled and cached!")
     
-    num_workers = mp.cpu_count() - 1 if mp.cpu_count() > 1 else 1 
+    num_workers = min(31, mp.cpu_count() - 1) 
     print(f"Starting {num_workers} CPU Process Workers...")
     
     start_time = time.time()
@@ -175,10 +201,9 @@ def test_model(num_games=100):
     shared_counter = ctx.Value('i', 0)
     
     shared_states_base = mp.Array(ctypes.c_float, num_workers * MAX_CAPACITY * 20 * 20 * 6)
-    shared_policies_base = mp.Array(ctypes.c_float, num_workers * MAX_CAPACITY * 67200)
     shared_values_base = mp.Array(ctypes.c_float, num_workers * MAX_CAPACITY)
     shared_scores_base = mp.Array(ctypes.c_float, num_workers * MAX_CAPACITY)
-    shared_data_bases = (shared_states_base, shared_policies_base, shared_values_base, shared_scores_base)
+    shared_data_bases = (shared_states_base, shared_values_base, shared_scores_base)
 
     pipes = [ctx.Pipe() for _ in range(num_workers)]
     parent_conns, child_conns = [p[0] for p in pipes], [p[1] for p in pipes]
