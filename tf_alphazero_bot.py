@@ -59,31 +59,23 @@ class AdvancedBlokusModel:
         )
         return model
 
+# 🛑 THE FIX: Stateless Node. Saves >10 GB of RAM.
 class ExpertNode:
-    def __init__(self, board, current_color, inventories, first_moves, parent=None, action_id=None, prior=0.0, q_init=0.0):
-        self.board = board
-        self.current_color = current_color
-        self.inventories = inventories
-        self.first_moves = first_moves
-        
-        self.parent = parent
-        self.action_id = action_id 
+    __slots__ = ['prior', 'q_init', 'children', 'visit_count', 'value_sum']
+    
+    def __init__(self, prior=0.0, q_init=0.0):
         self.prior = prior
+        self.q_init = q_init
         self.children = {}
-        
         self.visit_count = 0
         self.value_sum = 0.0
-        self.q_init = q_init 
-        
-        self.virtual_loss = 0.0
-        self.is_evaluating = False
 
     def is_expanded(self):
         return len(self.children) > 0
 
     def q_value(self): 
         if self.visit_count == 0: return self.q_init
-        return (self.value_sum - self.virtual_loss) / self.visit_count
+        return self.value_sum / self.visit_count
 
 class ExpertBlokusBot:
     def __init__(self, name="ExpertZero", model=None, pipe=None, shared_data=None, is_training=False):
@@ -105,68 +97,63 @@ class ExpertBlokusBot:
 
     def get_action(self, board, color, inventories, first_moves, legal_moves, is_training=True, fast_playout=False):
         num_simulations = 6 if fast_playout else 32
-        virtual_threads = 4 
         
-        root = ExpertNode(board, color, inventories, first_moves)
-        self._expand_and_evaluate_leaves([root], legal_moves_list=[legal_moves])
+        root = ExpertNode()
+        self._expand_and_evaluate(root, board, color, inventories, first_moves, legal_moves)
 
         if is_training:
             noise = np.random.dirichlet([0.05] * len(legal_moves))
-            for i, child in enumerate(root.children.values()):
-                child.prior = 0.75 * child.prior + 0.25 * noise[i]
+            for i, action in enumerate(legal_moves):
+                root.children[action].prior = 0.75 * root.children[action].prior + 0.25 * noise[i]
 
-        sims = 0
-        while sims < num_simulations:
-            leaves_to_eval = []
-            paths_to_eval = []
-
-            for _ in range(virtual_threads):
-                if sims >= num_simulations: break
-                node = root
-                path = [node]
+        for _ in range(num_simulations):
+            node = root
+            search_path = [node]
+            colors_in_path = [color]
+            
+            # Dynamic Running State
+            curr_board = [row[:] for row in board]
+            curr_inv = {k: list(v) for k, v in inventories.items()}
+            curr_first = dict(first_moves)
+            curr_color = color
+            
+            # Selection Phase
+            while node.is_expanded():
+                best_score = -float('inf')
+                best_action = None
+                best_child = None
+                for action, child in node.children.items():
+                    q = child.q_value() 
+                    u = self.c_puct * child.prior * math.sqrt(max(1, node.visit_count)) / (1 + child.visit_count)
+                    if q + u > best_score:
+                        best_score, best_action, best_child = q + u, action, child
                 
-                while node.is_expanded():
-                    node.virtual_loss += 1.0
-                    node.visit_count += 1
-                    
-                    best_score = -float('inf')
-                    best_child = None
-                    for child in node.children.values():
-                        q = child.q_value() 
-                        u = self.c_puct * child.prior * math.sqrt(max(1, node.visit_count)) / (1 + child.visit_count)
-                        if q + u > best_score:
-                            best_score, best_child = q + u, child
-                    node = best_child
-                    path.append(node)
+                node = best_child
+                search_path.append(node)
                 
-                # 🛑 THE FIX: Slice off the leaf node ([:-1]) to prevent Phantom Subtraction!
-                if node.is_evaluating:
-                    for n in path[:-1]:
-                        n.virtual_loss -= 1.0
-                        n.visit_count -= 1
-                    continue
-                
-                node.is_evaluating = True
-                node.virtual_loss += 1.0
-                node.visit_count += 1
-                leaves_to_eval.append(node)
-                paths_to_eval.append(path)
-                sims += 1
+                # Apply action to dynamic state
+                shape_name, coords = best_action[1], best_action[5]
+                for r, c in coords: curr_board[r][c] = curr_color
+                curr_inv[curr_color].remove(shape_name)
+                curr_first[curr_color] = False
+                curr_color = (curr_color % 4) + 1
+                colors_in_path.append(curr_color)
 
-            if not leaves_to_eval:
-                break
+            # Expansion Phase
+            node_legal_moves = self._get_legal_moves(curr_board, curr_color, curr_inv, curr_first)
+            if node_legal_moves:
+                v_leaf = self._expand_and_evaluate(node, curr_board, curr_color, curr_inv, curr_first, node_legal_moves)
+            else:
+                v_leaf = node.q_value() 
 
-            leaf_v_returns = self._expand_and_evaluate_leaves(leaves_to_eval)
-
-            for path, v_leaf in zip(paths_to_eval, leaf_v_returns):
-                leaf = path[-1]
-                leaf.is_evaluating = False
-                for n in reversed(path):
-                    n.virtual_loss -= 1.0
-                    if (n.current_color % 2) == (leaf.current_color % 2):
-                        n.value_sum += v_leaf
-                    else:
-                        n.value_sum -= v_leaf
+            # Backpropagation Phase
+            for n, step_color in zip(search_path, colors_in_path):
+                n.visit_count += 1
+                # If this node's decision-maker is on the same team as the leaf evaluator
+                if (step_color % 2) == (curr_color % 2):
+                    n.value_sum += v_leaf
+                else:
+                    n.value_sum -= v_leaf
 
         visits = [root.children[a].visit_count for a in legal_moves]
         if is_training:
@@ -178,94 +165,51 @@ class ExpertBlokusBot:
 
         return legal_moves[chosen_idx]
 
-    def _expand_and_evaluate_leaves(self, leaves, legal_moves_list=None):
-        all_after_states = []
-        leaf_state_bounds = []
-        fetched_legal_moves = []
-
-        for i, leaf in enumerate(leaves):
-            if legal_moves_list:
-                legal_moves = legal_moves_list[i]
-            else:
-                legal_moves = self._get_legal_moves(leaf.board, leaf.current_color, leaf.inventories, leaf.first_moves)
+    def _expand_and_evaluate(self, node, board, color, inventories, first_moves, legal_moves):
+        after_states = []
+        for action in legal_moves:
+            shape_name, coords = action[1], action[5]
             
-            fetched_legal_moves.append(legal_moves)
-            
-            if not legal_moves:
-                leaf_state_bounds.append(None)
-                continue
-
-            start_idx = len(all_after_states)
-            for action in legal_moves:
-                shape_name, coords = action[1], action[5]
-                next_board = [row[:] for row in leaf.board]
-                for r, c in coords: next_board[r][c] = leaf.current_color
-                    
-                next_inv = {k: list(v) for k, v in leaf.inventories.items()}
-                next_inv[leaf.current_color].remove(shape_name)
-                next_first = dict(leaf.first_moves)
-                next_first[leaf.current_color] = False
-                next_color = (leaf.current_color % 4) + 1
+            next_board = [row[:] for row in board]
+            for r, c in coords: next_board[r][c] = color
                 
-                astate = self._build_state_tensor(next_board, next_color, next_inv, next_first)
-                all_after_states.append(astate)
+            next_inv = {k: list(v) for k, v in inventories.items()}
+            next_inv[color].remove(shape_name)
+            next_first = dict(first_moves)
+            next_first[color] = False
+            next_color = (color % 4) + 1
             
-            end_idx = len(all_after_states)
-            leaf_state_bounds.append((start_idx, end_idx))
+            astate = self._build_state_tensor(next_board, next_color, next_inv, next_first)
+            after_states.append(astate)
             
-        batch_size = len(all_after_states)
+        batch_size = len(after_states)
         
-        if batch_size > 0:
-            if self.shared_data:
-                w_id, s_states, s_values, s_scores = self.shared_data
-                s_states[w_id, :batch_size] = all_after_states
-                self.pipe.send(batch_size) 
-                self.pipe.recv()     
-                values = s_values[w_id, :batch_size].copy()
-            else:
-                import tensorflow as tf
-                preds = self.model.predict(np.array(all_after_states), verbose=0)
-                values = preds[0].flatten()
+        if self.shared_data:
+            w_id, s_states, s_values, s_scores = self.shared_data
+            s_states[w_id, :batch_size] = after_states
+            self.pipe.send(batch_size) 
+            self.pipe.recv()     
+            values = s_values[w_id, :batch_size].copy()
         else:
-            values = []
+            import tensorflow as tf
+            preds = self.model.predict(np.array(after_states), verbose=0)
+            values = preds[0].flatten()
 
-        leaf_v_returns = []
-        temperature = 0.25 if self.is_training else 0.1
-
-        for leaf, bounds, legal_moves in zip(leaves, leaf_state_bounds, fetched_legal_moves):
-            if bounds is None:
-                leaf_v_returns.append(leaf.q_init) 
-                continue
-
-            start, end = bounds
-            leaf_vals = values[start:end]
-
-            next_color = (leaf.current_color % 4) + 1
-            is_enemy = (leaf.current_color % 2) != (next_color % 2)
+        next_color = (color % 4) + 1
+        is_enemy = (color % 2) != (next_color % 2)
+        
+        q_values = np.zeros(batch_size)
+        for i in range(batch_size):
+            q_values[i] = -values[i] if is_enemy else values[i]
             
-            q_values = np.zeros(len(leaf_vals))
-            for i in range(len(leaf_vals)):
-                q_values[i] = -leaf_vals[i] if is_enemy else leaf_vals[i]
-                
-            exp_q = np.exp((q_values - np.max(q_values)) / temperature)
-            priors = exp_q / np.sum(exp_q)
+        temperature = 0.25 if self.is_training else 0.1
+        exp_q = np.exp((q_values - np.max(q_values)) / temperature)
+        priors = exp_q / np.sum(exp_q)
 
-            for i, action in enumerate(legal_moves):
-                child_board = [row[:] for row in leaf.board]
-                for r, c in action[5]: child_board[r][c] = leaf.current_color
-                child_inv = {k: list(v) for k, v in leaf.inventories.items()}
-                child_inv[leaf.current_color].remove(action[1])
-                child_first = dict(leaf.first_moves)
-                child_first[leaf.current_color] = False
-                
-                leaf.children[action] = ExpertNode(
-                    board=child_board, current_color=next_color, inventories=child_inv, first_moves=child_first,
-                    parent=leaf, action_id=action[0], prior=priors[i], q_init=q_values[i]
-                )
-                
-            leaf_v_returns.append(np.max(q_values))
-
-        return leaf_v_returns
+        for i, action in enumerate(legal_moves):
+            node.children[action] = ExpertNode(prior=priors[i], q_init=q_values[i])
+            
+        return np.max(q_values) 
 
     def _build_state_tensor(self, board, color, inventories, first_moves):
         tensor = np.zeros((BOARD_SIZE, BOARD_SIZE, 6), dtype=np.float32)
