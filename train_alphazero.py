@@ -9,11 +9,11 @@ import concurrent.futures
 
 from helper import BOARD_SIZE, SHAPES
 
-# 🛑 Strict constants as requested
 MAX_ORDER = 15
 _NUM_CPUS = mp.cpu_count()
 NUM_WORKERS = min(31, _NUM_CPUS - 1 if _NUM_CPUS > 1 else 1)
 MAX_CAPACITY = 2048
+MIN_BATCH_SIZE = 512
 CHUNK_SIZE = 2 ** MAX_ORDER
 
 # 🚀 MULTITHREADING: Hides GPU pipe latency by swapping threads during I/O sleep
@@ -153,16 +153,30 @@ def training_inference_server(conns, fast_infer, shared_counter, total_games, sh
                 if rem >= CHUNK_SIZE:
                     p = CHUNK_SIZE
                 else:
-                    p = 1 << (rem.bit_length() - 1)
+                    # 🛑 Minimum Chunk Floor: If remainder is less than MIN_BATCH_SIZE, we force the chunk size
+                    # to be the remainder, but pad it up to MIN_BATCH_SIZE during execution below.
+                    if rem <= MIN_BATCH_SIZE:
+                        p = rem
+                    else:
+                        p = 1 << (rem.bit_length() - 1)
                 sizes.append(p)
                 rem -= p
                 
             tensor_cursor = 0
             for p in sizes:
                 chunk = batch_tensor[tensor_cursor : tensor_cursor + p]
-                preds = fast_infer(chunk)
-                v_preds.append(preds[0].numpy().flatten())
-                sc_preds.append(preds[1].numpy().flatten())
+                curr_size = chunk.shape[0]
+                
+                # 🛑 Dynamic Padding: If the chunk is smaller than MIN_BATCH_SIZE, clamp the tensor footprint to MIN_BATCH_SIZE
+                if curr_size < MIN_BATCH_SIZE:
+                    pad = np.zeros((MIN_BATCH_SIZE - curr_size, 20, 20, 6), dtype=np.float32)
+                    chunk_padded = np.concatenate([chunk, pad], axis=0)
+                else:
+                    chunk_padded = chunk
+                    
+                preds = fast_infer(chunk_padded)
+                v_preds.append(preds[0].numpy().flatten()[:curr_size]) # Strip the padded states back off
+                sc_preds.append(preds[1].numpy().flatten()[:curr_size])
                 tensor_cursor += p
                 
             t_infer = (time.time() - t1) * 1000 
