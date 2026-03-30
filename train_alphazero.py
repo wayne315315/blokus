@@ -8,14 +8,15 @@ import numpy as np
 
 from helper import BOARD_SIZE, SHAPES
 
-MAX_ORDER = 10
+MAX_ORDER = 15
 _NUM_CPUS = mp.cpu_count()
 NUM_WORKERS = min(31, _NUM_CPUS - 1 if _NUM_CPUS > 1 else 1)
 MAX_CAPACITY = 2048
 
 def generate_expert_game(bot):
     states, players = [], []
-    board = np.zeros((BOARD_SIZE, BOARD_SIZE))
+    #board = np.zeros((BOARD_SIZE, BOARD_SIZE))
+    board = [[0 for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
     inventories = {i: list(SHAPES.keys()) for i in range(1, 5)} 
     first_moves = {1: True, 2: True, 3: True, 4: True}
     current_player = 1
@@ -207,7 +208,7 @@ def run_training_pipeline(num_iteration=50):
         _ = fast_infer(tf.zeros((2 ** o, 20, 20, 6), dtype=tf.float32))
     print("✅ All dynamic graphs successfully compiled and cached!", flush=True)
     
-    TOTAL_GAMES_PER_ITERATION = 1000 
+    TOTAL_GAMES_PER_ITERATION = 31 
     games_per_worker = max(1, TOTAL_GAMES_PER_ITERATION // NUM_WORKERS)
     actual_total_games = NUM_WORKERS * games_per_worker
 

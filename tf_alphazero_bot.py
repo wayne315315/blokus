@@ -4,7 +4,8 @@ import math
 from helper import BOARD_SIZE, SHAPES, is_valid_move, rotate_shape, flip_shape
 
 class AdvancedBlokusModel:
-    def __init__(self, board_size=20, num_blocks=10, filters=128):
+    #def __init__(self, board_size=20, num_blocks=10, filters=128):
+    def __init__(self, board_size=20, num_blocks=2, filters=16):
         self.board_size = board_size
         self.num_blocks = num_blocks
         self.filters = filters
