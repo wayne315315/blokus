@@ -8,10 +8,8 @@ import numpy as np
 
 from helper import BOARD_SIZE, SHAPES
 
-# 🛑 IMPORT ISOLATION: No global TensorFlow import here to save ~15GB of worker RAM!
 MAX_ORDER = 10
 _NUM_CPUS = mp.cpu_count()
-# 🛑 Pure Python Parallelism: 1 Process = 1 Game (No GIL Blocking!)
 NUM_WORKERS = min(31, _NUM_CPUS - 1 if _NUM_CPUS > 1 else 1)
 MAX_CAPACITY = 2048
 
@@ -130,7 +128,6 @@ def training_inference_server(conns, fast_infer, shared_counter, total_games, sh
             t1 = time.time()
             v_preds, sc_preds = [], []
             
-            # 🚀 POWER-OF-2 DECOMPOSITION ALGORITHM
             sizes = []
             rem = actual_size
             while rem > 0:
@@ -181,9 +178,11 @@ def training_inference_server(conns, fast_infer, shared_counter, total_games, sh
     print("\n✅ All GPU processes finished gathering data.", flush=True)
 
 def run_training_pipeline(num_iteration=50):
-    # 🛑 IMPORT ISOLATION: Load TF only in main process to save 15 GB RAM
     import tensorflow as tf
     from tf_alphazero_bot import AdvancedBlokusModel
+
+    # 🚀 ENABLE MIXED PRECISION (FLOAT16)
+    tf.keras.mixed_precision.set_global_policy('mixed_float16')
 
     gpus = tf.config.list_physical_devices('GPU')
     if gpus: tf.config.experimental.set_memory_growth(gpus[0], True)

@@ -133,7 +133,6 @@ def test_inference_server(conns, fast_infer, shared_counter, total_games, shared
             t1 = time.time()
             v_preds, sc_preds = [], []
             
-            # 🚀 POWER-OF-2 DECOMPOSITION ALGORITHM
             sizes = []
             rem = actual_size
             while rem > 0:
@@ -186,6 +185,9 @@ def test_inference_server(conns, fast_infer, shared_counter, total_games, shared
 def test_model(num_games=124):
     import tensorflow as tf
     
+    # 🚀 ENABLE MIXED PRECISION (FLOAT16)
+    tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
     keras_path = "blokus_expert_latest.keras"
     if not os.path.exists(keras_path):
         fallback = "blokus_expert_v18.keras"

@@ -14,6 +14,7 @@ class AdvancedBlokusModel:
         import tensorflow as tf
         from tensorflow.keras import layers, models
 
+        # Inputs start as float32; the mixed precision policy will automatically cast them downward
         inputs = layers.Input(shape=(self.board_size, self.board_size, 6))
 
         x = layers.Conv2D(self.filters, 3, padding='same', use_bias=False)(inputs)
@@ -41,14 +42,16 @@ class AdvancedBlokusModel:
         v = layers.Activation('relu')(v)
         v = layers.Flatten()(v)
         v = layers.Dense(256, activation='relu')(v)
-        value_out = layers.Dense(1, activation='tanh', name='value')(v)
+        # 🛑 MIXED PRECISION REQUIREMENT: Final output must be float32 for numerical stability!
+        value_out = layers.Dense(1, activation='tanh', name='value', dtype='float32')(v)
 
         s = layers.Conv2D(1, 1, padding='same', use_bias=False)(x)
         s = layers.BatchNormalization()(s)
         s = layers.Activation('relu')(s)
         s = layers.Flatten()(s)
         s = layers.Dense(256, activation='relu')(s)
-        score_out = layers.Dense(1, name='score_lead')(s)  
+        # 🛑 MIXED PRECISION REQUIREMENT: Final output must be float32 for numerical stability!
+        score_out = layers.Dense(1, name='score_lead', dtype='float32')(s)  
 
         model = models.Model(inputs=inputs, outputs=[value_out, score_out])
         
@@ -59,7 +62,6 @@ class AdvancedBlokusModel:
         )
         return model
 
-# 🛑 THE FIX: Stateless Node. Saves >10 GB of RAM.
 class ExpertNode:
     __slots__ = ['prior', 'q_init', 'children', 'visit_count', 'value_sum']
     
@@ -149,7 +151,6 @@ class ExpertBlokusBot:
             # Backpropagation Phase
             for n, step_color in zip(search_path, colors_in_path):
                 n.visit_count += 1
-                # If this node's decision-maker is on the same team as the leaf evaluator
                 if (step_color % 2) == (curr_color % 2):
                     n.value_sum += v_leaf
                 else:
