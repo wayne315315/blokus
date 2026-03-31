@@ -8,6 +8,7 @@ import numpy as np
 cimport numpy as np
 from libc.math cimport sqrt
 from helper import BOARD_SIZE, SHAPES, flip_shape, rotate_shape
+import concurrent.futures
 
 class AdvancedBlokusModel:
     def __init__(self, board_size=20, num_blocks=4, filters=16):
@@ -70,20 +71,26 @@ cdef class ExpertNode:
     cdef public dict children
     cdef public int visit_count
     cdef public double value_sum
+    cdef public int virtual_loss 
+    cdef public object lock       
 
     def __init__(self, double prior=0.0, double q_init=0.0):
+        import threading
         self.prior = prior
         self.q_init = q_init
         self.children = {}
         self.visit_count = 0
         self.value_sum = 0.0
+        self.virtual_loss = 0
+        self.lock = threading.Lock()
 
     cdef bint is_expanded(self):
         return len(self.children) > 0
 
     cdef double q_value(self): 
-        if self.visit_count == 0: return self.q_init
-        return self.value_sum / self.visit_count
+        cdef int effective_visits = self.visit_count + self.virtual_loss
+        if effective_visits == 0: return self.q_init
+        return (self.value_sum - self.virtual_loss) / effective_visits
 
 cdef list get_valid_corners(int[:, :] board, int color, bint is_first):
     cdef int r, c
@@ -156,14 +163,17 @@ cdef class ExpertBlokusBot:
     cdef public list shape_keys
     cdef public dict shape_to_id
     cdef public dict precomputed_shapes
+    cdef public object pipe_lock  
 
     def __init__(self, name="ExpertZero", model=None, pipe=None, shared_data=None, is_training=False):
+        import threading
         self.name = name
         self.model = model
         self.pipe = pipe
         self.shared_data = shared_data
         self.is_training = is_training
         self.c_puct = 1.5
+        self.pipe_lock = threading.Lock()
 
         self.shape_keys = list(SHAPES.keys())
         self.shape_to_id = {name: idx for idx, name in enumerate(self.shape_keys)}
@@ -185,7 +195,6 @@ cdef class ExpertBlokusBot:
                     orient_id += 1
             self.precomputed_shapes[shape_name] = transforms
 
-    # 🚀 PYTHON BRIDGE: Converts Python Lists to C Memory Views
     cpdef list _get_legal_moves(self, list board, int color, dict inventories, dict first_moves):
         cdef np.ndarray board_np = np.array(board, dtype=np.int32)
         cdef int[:, :] board_view = board_np
@@ -197,7 +206,6 @@ cdef class ExpertBlokusBot:
         
         return self.c_get_legal_moves(board_view, color, my_shapes, first_moves[color])
 
-    # 🚀 PYTHON BRIDGE: Converts Python Lists to C Memory Views
     cpdef np.ndarray _build_state_tensor(self, list board, int color, dict inventories, dict first_moves):
         cdef np.ndarray board_np = np.array(board, dtype=np.int32)
         cdef int[:, :] board_view = board_np
@@ -217,6 +225,85 @@ cdef class ExpertBlokusBot:
         action = self.get_action(board, color, inventories, first_moves, legal_moves, self.is_training)
         return self._decode_action(action, legal_moves)
 
+    # 🚀 FIX: Extracted Simulation Logic to prevent Cython Closure Error
+    def _run_single_simulation(self, ExpertNode root, np.ndarray board_np, int color, dict inventories, dict first_moves):
+        cdef ExpertNode node = root
+        cdef list search_path = [node]
+        cdef list colors_in_path = [color]
+        
+        cdef np.ndarray curr_board_np = np.array(board_np, copy=True, dtype=np.int32)
+        cdef int[:, :] curr_board_view = curr_board_np
+        
+        cdef dict curr_inv = {k: list(v) for k, v in inventories.items()}
+        cdef dict curr_first = dict(first_moves)
+        cdef int curr_color = color
+        cdef double best_score, q, u
+        cdef tuple best_action
+        cdef ExpertNode best_child, child, n
+        cdef str shape_name
+        cdef tuple shifted_coords
+        cdef list my_shapes
+        cdef list node_legal_moves
+        cdef double v_leaf
+        cdef int r, c, step_color # 🚀 FIX: Explicit types to fix Indexing warnings
+        
+        while True:
+            with node.lock:
+                if not node.is_expanded():
+                    break
+                best_score = -999999.0
+                best_action = None
+                best_child = None
+                for action, child_obj in node.children.items():
+                    child = <ExpertNode>child_obj
+                    q = child.q_value()
+                    u = self.c_puct * child.prior * sqrt(max(1.0, float(node.visit_count + node.virtual_loss))) / (1.0 + child.visit_count + child.virtual_loss)
+                    if q + u > best_score:
+                        best_score = q + u
+                        best_action = action
+                        best_child = child
+                
+                best_child.virtual_loss += 3
+                node = best_child
+                search_path.append(node)
+            
+            shape_name = best_action[1]
+            shifted_coords = best_action[5]
+            
+            # 🚀 FIX: Explicit unpacking to satisfy Cython index speed
+            for r, c in shifted_coords:
+                curr_board_view[r, c] = curr_color
+                
+            curr_inv[curr_color].remove(shape_name)
+            curr_first[curr_color] = False
+            curr_color = (curr_color % 4) + 1
+            colors_in_path.append(curr_color)
+
+        if curr_color in curr_inv:
+            my_shapes = curr_inv[curr_color]
+        elif str(curr_color) in curr_inv:
+            my_shapes = curr_inv[str(curr_color)]
+        else:
+            my_shapes = []
+
+        node_legal_moves = self.c_get_legal_moves(curr_board_view, curr_color, my_shapes, curr_first[curr_color])
+        
+        if node_legal_moves:
+            v_leaf = self._expand_and_evaluate(node, curr_board_view, curr_color, curr_inv, curr_first, node_legal_moves)
+        else:
+            v_leaf = node.q_value()
+            
+        for n_obj, step_color in zip(search_path, colors_in_path):
+            n = <ExpertNode>n_obj
+            with n.lock:
+                if n is not root:
+                    n.virtual_loss -= 3
+                n.visit_count += 1
+                if (step_color % 2) == (curr_color % 2):
+                    n.value_sum += v_leaf
+                else:
+                    n.value_sum -= v_leaf
+
     cpdef get_action(self, list board, int color, dict inventories, dict first_moves, list legal_moves, bint is_training=True, bint fast_playout=False):
         cdef int num_simulations = 6 if fast_playout else 32
         cdef ExpertNode root = ExpertNode()
@@ -225,81 +312,14 @@ cdef class ExpertBlokusBot:
         
         self._expand_and_evaluate(root, board_view, color, inventories, first_moves, legal_moves)
 
-        cdef int i, r, c
-        cdef ExpertNode node, best_child
-        cdef double best_score, q, u
-        cdef list search_path, colors_in_path, node_legal_moves
-        cdef dict curr_inv, curr_first
-        cdef int curr_color, step_color
-        cdef np.ndarray curr_board_np
-        cdef int[:, :] curr_board_view
-        cdef double v_leaf
-        cdef list my_shapes
-        
         if is_training:
             noise = np.random.dirichlet([0.05] * len(legal_moves))
             for idx, action in enumerate(legal_moves):
                 (<ExpertNode>root.children[action]).prior = 0.75 * (<ExpertNode>root.children[action]).prior + 0.25 * noise[idx]
 
-        for i in range(num_simulations):
-            node = root
-            search_path = [node]
-            colors_in_path = [color]
-            
-            curr_board_np = np.array(board_np, copy=True, dtype=np.int32)
-            curr_board_view = curr_board_np
-            
-            curr_inv = {k: list(v) for k, v in inventories.items()}
-            curr_first = dict(first_moves)
-            curr_color = color
-            
-            while node.is_expanded():
-                best_score = -999999.0
-                best_action = None
-                best_child = None
-                for action, child_obj in node.children.items():
-                    child = <ExpertNode>child_obj
-                    q = child.q_value()
-                    u = self.c_puct * child.prior * sqrt(max(1, node.visit_count)) / (1 + child.visit_count)
-                    if q + u > best_score:
-                        best_score = q + u
-                        best_action = action
-                        best_child = child
-                        
-                node = best_child
-                search_path.append(node)
-                
-                shape_name = best_action[1]
-                shifted_coords = best_action[5]
-                for r, c in shifted_coords:
-                    curr_board_view[r, c] = curr_color
-                    
-                curr_inv[curr_color].remove(shape_name)
-                curr_first[curr_color] = False
-                curr_color = (curr_color % 4) + 1
-                colors_in_path.append(curr_color)
-
-            if curr_color in curr_inv:
-                my_shapes = curr_inv[curr_color]
-            elif str(curr_color) in curr_inv:
-                my_shapes = curr_inv[str(curr_color)]
-            else:
-                my_shapes = []
-
-            node_legal_moves = self.c_get_legal_moves(curr_board_view, curr_color, my_shapes, curr_first[curr_color])
-            
-            if node_legal_moves:
-                v_leaf = self._expand_and_evaluate(node, curr_board_view, curr_color, curr_inv, curr_first, node_legal_moves)
-            else:
-                v_leaf = node.q_value()
-                
-            for n_obj, step_color in zip(search_path, colors_in_path):
-                n = <ExpertNode>n_obj
-                n.visit_count += 1
-                if (step_color % 2) == (curr_color % 2):
-                    n.value_sum += v_leaf
-                else:
-                    n.value_sum -= v_leaf
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(self._run_single_simulation, root, board_np, color, inventories, first_moves) for _ in range(num_simulations)]
+            concurrent.futures.wait(futures)
 
         cdef list visits = [(<ExpertNode>root.children[a]).visit_count for a in legal_moves]
         cdef int chosen_idx
@@ -333,6 +353,7 @@ cdef class ExpertBlokusBot:
             next_board_np = np.array(board_view, copy=True, dtype=np.int32)
             next_board_view = next_board_np
             
+            # 🚀 FIX: Explicit unpacking to satisfy Cython index speed
             for r, c in shifted_coords:
                 next_board_view[r, c] = color
                 
@@ -349,14 +370,16 @@ cdef class ExpertBlokusBot:
         
         if self.shared_data is not None:
             w_id, s_states, s_values, s_scores = self.shared_data
-            s_states[w_id, :batch_size] = after_states
-            self.pipe.send(batch_size)
-            self.pipe.recv()
-            values = s_values[w_id, :batch_size].copy()
+            with self.pipe_lock:
+                s_states[w_id, :batch_size] = after_states
+                self.pipe.send(batch_size)
+                self.pipe.recv()
+                values = s_values[w_id, :batch_size].copy()
         else:
-            import tensorflow as tf
-            preds = self.model.predict(np.array(after_states), verbose=0)
-            values = preds[0].flatten()
+            with self.pipe_lock:
+                import tensorflow as tf
+                preds = self.model.predict(np.array(after_states), verbose=0)
+                values = preds[0].flatten()
 
         cdef bint is_enemy = (color % 2) != (next_color % 2)
         cdef np.ndarray q_values = np.zeros(batch_size, dtype=np.float64)
@@ -371,12 +394,13 @@ cdef class ExpertBlokusBot:
         cdef np.ndarray exp_q = np.exp((q_values - max_q) / temperature)
         cdef np.ndarray priors = exp_q / np.sum(exp_q)
 
-        for i, action in enumerate(legal_moves):
-            node.children[action] = ExpertNode(prior=priors[i], q_init=q_values[i])
+        with node.lock:
+            for i, action in enumerate(legal_moves):
+                if action not in node.children:
+                    node.children[action] = ExpertNode(prior=priors[i], q_init=q_values[i])
             
         return max_q
 
-    # 🚀 INTERNAL C METHOD: Hyper-fast Tensor Building
     cdef np.ndarray c_build_state_tensor(self, int[:, :] board_view, int color, dict first_moves):
         cdef np.ndarray tensor = np.zeros((20, 20, 8), dtype=np.float32)
         cdef float[:, :, :] tensor_view = tensor
@@ -394,7 +418,6 @@ cdef class ExpertBlokusBot:
                 
         return tensor
 
-    # 🚀 INTERNAL C METHOD: Hyper-fast Move Generation
     cdef list c_get_legal_moves(self, int[:, :] board_view, int color, list my_shapes, bint is_first):
         cdef list legal_moves = []
         cdef int shape_idx, orient_idx, r, c, cr, cc, br, bc, max_r, max_c, sr, sc

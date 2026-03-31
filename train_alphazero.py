@@ -56,7 +56,9 @@ def generate_expert_game(bot):
             val_targets.append(1 if team2_score < team1_score else -1)
             score_targets.append(team1_score - team2_score)
 
-    return states, val_targets, score_targets
+    # 🚀 RESTORED TURN TRACKER
+    total_turns_played = 84 - sum(len(inv) for inv in inventories.values())
+    return states, val_targets, score_targets, total_turns_played
 
 def distributed_train_worker(games_per_worker, conn, result_queue, worker_idx, shared_counter, shared_data_bases, num_workers):
     os.environ['CUDA_VISIBLE_DEVICES'] = '-1' 
@@ -64,7 +66,6 @@ def distributed_train_worker(games_per_worker, conn, result_queue, worker_idx, s
     
     from tf_alphazero_bot import ExpertBlokusBot
     
-    # 🚀 TENSOR CORE OPTIMIZATION: Channels bumped to 8
     shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((num_workers, MAX_CAPACITY, 20, 20, 8))
     shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((num_workers, MAX_CAPACITY))
     shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((num_workers, MAX_CAPACITY))
@@ -72,16 +73,18 @@ def distributed_train_worker(games_per_worker, conn, result_queue, worker_idx, s
     bot = ExpertBlokusBot(pipe=conn, shared_data=(worker_idx, shared_states, shared_values, shared_scores), is_training=True)
     
     S, V, SC = [], [], []
+    worker_total_turns = 0 
+    
     for _ in range(games_per_worker):
-        s, v, sc = generate_expert_game(bot)
+        s, v, sc, turns = generate_expert_game(bot)
         S.extend(s); V.extend(v); SC.extend(sc)
+        worker_total_turns += turns
         with shared_counter.get_lock(): shared_counter.value += 1
             
     conn.send("DONE") 
-    result_queue.put((S, V, SC))
+    result_queue.put((S, V, SC, worker_total_turns))
 
 def training_inference_server(conns, fast_infer, shared_counter, total_games, shared_data_bases, num_workers):
-    # 🚀 TENSOR CORE OPTIMIZATION: Channels bumped to 8
     shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((num_workers, MAX_CAPACITY, 20, 20, 8))
     shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((num_workers, MAX_CAPACITY))
     shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((num_workers, MAX_CAPACITY))
@@ -98,7 +101,6 @@ def training_inference_server(conns, fast_infer, shared_counter, total_games, sh
 
     print("🔥 Allocating Static Server Buffer in System RAM...", flush=True)
     MAX_POSSIBLE_BATCH = num_workers * MAX_CAPACITY
-    # 🚀 TENSOR CORE OPTIMIZATION: Channels bumped to 8
     SERVER_BUFFER = np.empty((MAX_POSSIBLE_BATCH, 20, 20, 8), dtype=np.float32)
     SERVER_BUFFER.fill(0.0) 
 
@@ -144,7 +146,6 @@ def training_inference_server(conns, fast_infer, shared_counter, total_games, sh
                 chunk = batch_tensor[tensor_cursor : tensor_cursor + curr_size]
                 
                 if pad_target > curr_size:
-                    # 🚀 TENSOR CORE OPTIMIZATION: Channels bumped to 8
                     pad_array = np.zeros((pad_target - curr_size, 20, 20, 8), dtype=np.float32)
                     chunk_padded = np.concatenate([chunk, pad_array], axis=0)
                 else:
@@ -213,10 +214,8 @@ def run_training_pipeline(num_iteration=50):
         return model(batch_tensor, training=False)
 
     print(f"🔥 Pre-compiling Power-of-2 XLA Buckets (64 to {2 ** MAX_ORDER}) into System RAM...", flush=True)
-    for p in [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]:
-        if p > 2 ** MAX_ORDER: break
-        # 🚀 TENSOR CORE OPTIMIZATION: Channels bumped to 8
-        _ = fast_infer(tf.zeros((p, 20, 20, 8), dtype=tf.float32))
+    for o in range(6, MAX_ORDER + 1):
+        _ = fast_infer(tf.zeros((2 ** o, 20, 20, 8), dtype=tf.float32))
     print("✅ All dynamic graphs successfully compiled and cached!", flush=True)
     
     TOTAL_GAMES_PER_ITERATION = 1024
@@ -232,7 +231,6 @@ def run_training_pipeline(num_iteration=50):
         ctx = mp.get_context('spawn')
         
         shared_counter = ctx.Value('i', 0)
-        # 🚀 TENSOR CORE OPTIMIZATION: Channels bumped to 8
         shared_states_base = mp.Array(ctypes.c_float, NUM_WORKERS * MAX_CAPACITY * 20 * 20 * 8)
         shared_values_base = mp.Array(ctypes.c_float, NUM_WORKERS * MAX_CAPACITY)
         shared_scores_base = mp.Array(ctypes.c_float, NUM_WORKERS * MAX_CAPACITY)
@@ -252,14 +250,19 @@ def run_training_pipeline(num_iteration=50):
         training_inference_server(parent_conns, fast_infer, shared_counter, actual_total_games, shared_data_bases, NUM_WORKERS)
 
         S, V, SC = [], [], []
+        iteration_total_turns = 0
+        
         for _ in range(NUM_WORKERS):
-            s, v, sc = result_queue.get()
+            s, v, sc, turns = result_queue.get()
             S.extend(s); V.extend(v); SC.extend(sc)
+            iteration_total_turns += turns
 
         for p in processes: p.join()
         
         generation_time = time.time() - start_time
-        print(f"\n✅ Data Generation Complete in {generation_time:.1f}s. Extracted {len(S)} Deep States.", flush=True)
+        avg_game_length = iteration_total_turns / actual_total_games
+        
+        print(f"\n✅ Data Generation Complete in {generation_time:.1f}s | Saved States: {len(S)} | EXACT Avg Turns/Game: {avg_game_length:.1f}", flush=True)
         print(f"🧠 Constructing tf.data.Dataset Pipeline...", flush=True)
 
         dataset = tf.data.Dataset.from_tensor_slices((np.array(S, dtype=np.float32), {'value': np.array(V, dtype=np.float32), 'score_lead': np.array(SC, dtype=np.float32)}))
