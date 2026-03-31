@@ -163,10 +163,12 @@ cdef class ExpertBlokusBot:
     cdef public list shape_keys
     cdef public dict shape_to_id
     cdef public dict precomputed_shapes
-    cdef public object pipe_lock  
+    cdef public object pipe_lock
+    cdef public object executor
 
     def __init__(self, name="ExpertZero", model=None, pipe=None, shared_data=None, is_training=False):
         import threading
+        import concurrent.futures
         self.name = name
         self.model = model
         self.pipe = pipe
@@ -174,6 +176,9 @@ cdef class ExpertBlokusBot:
         self.is_training = is_training
         self.c_puct = 1.5
         self.pipe_lock = threading.Lock()
+        
+        # 🚀 FIX: Persistent executor to prevent RAM thread stack fragmentation
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
         self.shape_keys = list(SHAPES.keys())
         self.shape_to_id = {name: idx for idx, name in enumerate(self.shape_keys)}
@@ -225,7 +230,6 @@ cdef class ExpertBlokusBot:
         action = self.get_action(board, color, inventories, first_moves, legal_moves, self.is_training)
         return self._decode_action(action, legal_moves)
 
-    # 🚀 FIX: Extracted Simulation Logic to prevent Cython Closure Error
     def _run_single_simulation(self, ExpertNode root, np.ndarray board_np, int color, dict inventories, dict first_moves):
         cdef ExpertNode node = root
         cdef list search_path = [node]
@@ -237,15 +241,18 @@ cdef class ExpertBlokusBot:
         cdef dict curr_inv = {k: list(v) for k, v in inventories.items()}
         cdef dict curr_first = dict(first_moves)
         cdef int curr_color = color
-        cdef double best_score, q, u
-        cdef tuple best_action
-        cdef ExpertNode best_child, child, n
+        cdef double best_score = -999999.0
+        cdef double q = 0.0, u = 0.0
+        cdef tuple best_action = None
+        cdef ExpertNode best_child = None
+        cdef ExpertNode child = None
+        cdef ExpertNode n = None
         cdef str shape_name
         cdef tuple shifted_coords
         cdef list my_shapes
         cdef list node_legal_moves
-        cdef double v_leaf
-        cdef int r, c, step_color # 🚀 FIX: Explicit types to fix Indexing warnings
+        cdef double v_leaf = 0.0
+        cdef int r, c, step_color 
         
         while True:
             with node.lock:
@@ -270,8 +277,9 @@ cdef class ExpertBlokusBot:
             shape_name = best_action[1]
             shifted_coords = best_action[5]
             
-            # 🚀 FIX: Explicit unpacking to satisfy Cython index speed
-            for r, c in shifted_coords:
+            for r_c in shifted_coords:
+                r = r_c[0]
+                c = r_c[1]
                 curr_board_view[r, c] = curr_color
                 
             curr_inv[curr_color].remove(shape_name)
@@ -317,9 +325,9 @@ cdef class ExpertBlokusBot:
             for idx, action in enumerate(legal_moves):
                 (<ExpertNode>root.children[action]).prior = 0.75 * (<ExpertNode>root.children[action]).prior + 0.25 * noise[idx]
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [executor.submit(self._run_single_simulation, root, board_np, color, inventories, first_moves) for _ in range(num_simulations)]
-            concurrent.futures.wait(futures)
+        import concurrent.futures
+        futures = [self.executor.submit(self._run_single_simulation, root, board_np, color, inventories, first_moves) for _ in range(num_simulations)]
+        concurrent.futures.wait(futures)
 
         cdef list visits = [(<ExpertNode>root.children[a]).visit_count for a in legal_moves]
         cdef int chosen_idx
@@ -353,8 +361,9 @@ cdef class ExpertBlokusBot:
             next_board_np = np.array(board_view, copy=True, dtype=np.int32)
             next_board_view = next_board_np
             
-            # 🚀 FIX: Explicit unpacking to satisfy Cython index speed
-            for r, c in shifted_coords:
+            for r_c in shifted_coords:
+                r = r_c[0]
+                c = r_c[1]
                 next_board_view[r, c] = color
                 
             next_inv = {k: list(v) for k, v in inventories.items()}

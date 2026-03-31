@@ -4,6 +4,7 @@ import multiprocessing as mp
 import multiprocessing.connection 
 import ctypes
 import numpy as np
+import concurrent.futures
 
 from helper import BOARD_SIZE, SHAPES
 from player import BotPlayer  
@@ -11,7 +12,9 @@ from player import BotPlayer
 MAX_ORDER = 10
 _NUM_CPUS = mp.cpu_count()
 NUM_WORKERS = min(31, _NUM_CPUS - 1 if _NUM_CPUS > 1 else 1)
-MAX_CAPACITY = 2048
+MAX_CAPACITY = 512
+NUM_THREADS = 16
+TOTAL_THREADS = NUM_WORKERS * NUM_THREADS
 
 def play_test_game(adv_bot, std_bot_1, std_bot_2, play_as_first):
     board = [[0 for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
@@ -59,41 +62,53 @@ def play_test_game(adv_bot, std_bot_1, std_bot_2, play_as_first):
         
     return aw, sw, t, az_score_diff
 
-def distributed_test_worker(games_per_worker, conn, result_queue, worker_idx, shared_counter, shared_data_bases, num_workers):
-    os.environ['CUDA_VISIBLE_DEVICES'] = '-1' 
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
-    
+def single_thread_task(games_per_thread, conn, thread_idx, shared_data_bases, total_threads, shared_counter):
     from tf_alphazero_bot import ExpertBlokusBot
+    shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((total_threads, MAX_CAPACITY, 20, 20, 8))
+    shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((total_threads, MAX_CAPACITY))
+    shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((total_threads, MAX_CAPACITY))
     
-    # 🚀 TENSOR CORE OPTIMIZATION: Channels bumped to 8
-    shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((num_workers, MAX_CAPACITY, 20, 20, 8))
-    shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((num_workers, MAX_CAPACITY))
-    shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((num_workers, MAX_CAPACITY))
-    
-    bot = ExpertBlokusBot(pipe=conn, shared_data=(worker_idx, shared_states, shared_values, shared_scores), is_training=False)
+    bot = ExpertBlokusBot(pipe=conn, shared_data=(thread_idx, shared_states, shared_values, shared_scores), is_training=False)
     std_bot_1 = BotPlayer() 
     std_bot_2 = BotPlayer()
 
     az_wins, std_wins, ties, az_score_diff = 0, 0, 0, 0
-    for i in range(games_per_worker):
+    for i in range(games_per_thread):
         play_as_first = (i % 2 == 0)
         aw, sw, t, diff = play_test_game(bot, std_bot_1, std_bot_2, play_as_first)
         az_wins += aw; std_wins += sw; ties += t; az_score_diff += diff
         with shared_counter.get_lock(): shared_counter.value += 1
 
     conn.send("DONE") 
+    if hasattr(bot, 'executor') and bot.executor is not None:
+        bot.executor.shutdown(wait=False)
+    return az_wins, std_wins, ties, az_score_diff
+
+def distributed_test_worker(games_per_thread, worker_conns, result_queue, worker_thread_ids, shared_counter, shared_data_bases, total_threads):
+    os.environ['CUDA_VISIBLE_DEVICES'] = '-1' 
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
+    
+    az_wins, std_wins, ties, az_score_diff = 0, 0, 0, 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(worker_conns)) as executor:
+        futures = []
+        for conn, tid in zip(worker_conns, worker_thread_ids):
+            futures.append(executor.submit(single_thread_task, games_per_thread, conn, tid, shared_data_bases, total_threads, shared_counter))
+            
+        for f in concurrent.futures.as_completed(futures):
+            aw, sw, t, diff = f.result()
+            az_wins += aw; std_wins += sw; ties += t; az_score_diff += diff
+            
     result_queue.put([az_wins, std_wins, ties, az_score_diff])
 
-def test_inference_server(conns, fast_infer, shared_counter, total_games, shared_data_bases, num_workers):
+def test_inference_server(conns, fast_infer, shared_counter, total_games, shared_data_bases, total_threads):
     import tensorflow as tf
     
-    # 🚀 TENSOR CORE OPTIMIZATION: Channels bumped to 8
-    shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((num_workers, MAX_CAPACITY, 20, 20, 8))
-    shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((num_workers, MAX_CAPACITY))
-    shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((num_workers, MAX_CAPACITY))
+    shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((total_threads, MAX_CAPACITY, 20, 20, 8))
+    shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((total_threads, MAX_CAPACITY))
+    shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((total_threads, MAX_CAPACITY))
 
     active_conns = list(conns)
-    conn_to_id = {conns[i]: i for i in range(num_workers)}
+    conn_to_id = {conns[i]: i for i in range(total_threads)}
     
     ready_indices, batch_sizes, ready_pipes = [], [], []
     total_states_queued = 0
@@ -103,8 +118,7 @@ def test_inference_server(conns, fast_infer, shared_counter, total_games, shared
     MIN_BATCH_SIZE = 64
 
     print("🔥 Allocating Static Server Buffer in System RAM...", flush=True)
-    MAX_POSSIBLE_BATCH = num_workers * MAX_CAPACITY
-    # 🚀 TENSOR CORE OPTIMIZATION: Channels bumped to 8
+    MAX_POSSIBLE_BATCH = total_threads * MAX_CAPACITY
     SERVER_BUFFER = np.empty((MAX_POSSIBLE_BATCH, 20, 20, 8), dtype=np.float32)
     SERVER_BUFFER.fill(0.0)
 
@@ -150,7 +164,6 @@ def test_inference_server(conns, fast_infer, shared_counter, total_games, shared
                 chunk = batch_tensor[tensor_cursor : tensor_cursor + curr_size]
                 
                 if pad_target > curr_size:
-                    # 🚀 TENSOR CORE OPTIMIZATION: Channels bumped to 8
                     pad_array = np.zeros((pad_target - curr_size, 20, 20, 8), dtype=np.float32)
                     chunk_padded = np.concatenate([chunk, pad_array], axis=0)
                 else:
@@ -218,11 +231,9 @@ def test_model(num_games=124):
     def fast_infer(batch_tensor): 
         return model(batch_tensor, training=False)
 
-    print(f"🔥 Pre-compiling Power-of-2 XLA Buckets (64 to {MAX_CAPACITY}) into System RAM...")
-    for p in [64, 128, 256, 512, 1024, 2048]:
-        if p > 2 ** MAX_ORDER: break
-        # 🚀 TENSOR CORE OPTIMIZATION: Channels bumped to 8
-        _ = fast_infer(tf.zeros((p, 20, 20, 8), dtype=tf.float32))
+    print(f"🔥 Pre-compiling Power-of-2 XLA Buckets (64 to {2 ** MAX_ORDER}) into System RAM...")
+    for p in range(6, MAX_ORDER + 1):
+        _ = fast_infer(tf.zeros((2 ** p, 20, 20, 8), dtype=tf.float32))
     print("✅ All dynamic graphs successfully compiled and cached!")
 
     print("="*60)
@@ -233,26 +244,28 @@ def test_model(num_games=124):
     ctx = mp.get_context('spawn')
     
     shared_counter = ctx.Value('i', 0)
-    # 🚀 TENSOR CORE OPTIMIZATION: Channels bumped to 8
-    shared_states_base = mp.Array(ctypes.c_float, NUM_WORKERS * MAX_CAPACITY * 20 * 20 * 8)
-    shared_values_base = mp.Array(ctypes.c_float, NUM_WORKERS * MAX_CAPACITY)
-    shared_scores_base = mp.Array(ctypes.c_float, NUM_WORKERS * MAX_CAPACITY)
+    shared_states_base = mp.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY * 20 * 20 * 8)
+    shared_values_base = mp.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY)
+    shared_scores_base = mp.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY)
     shared_data_bases = (shared_states_base, shared_values_base, shared_scores_base)
 
-    pipes = [ctx.Pipe() for _ in range(NUM_WORKERS)]
+    pipes = [ctx.Pipe() for _ in range(TOTAL_THREADS)]
     parent_conns, child_conns = [p[0] for p in pipes], [p[1] for p in pipes]
     
     result_queue = ctx.Queue()
     processes = []
     
-    games_per_worker = max(1, num_games // NUM_WORKERS)
+    games_per_thread = max(1, num_games // TOTAL_THREADS)
     
     for i in range(NUM_WORKERS):
-        p = ctx.Process(target=distributed_test_worker, args=(games_per_worker, child_conns[i], result_queue, i, shared_counter, shared_data_bases, NUM_WORKERS))
+        conns_for_worker = child_conns[i * NUM_THREADS : (i + 1) * NUM_THREADS]
+        indices_for_worker = list(range(i * NUM_THREADS, (i + 1) * NUM_THREADS))
+        
+        p = ctx.Process(target=distributed_test_worker, args=(games_per_thread, conns_for_worker, result_queue, indices_for_worker, shared_counter, shared_data_bases, TOTAL_THREADS))
         p.start()
         processes.append(p)
 
-    test_inference_server(parent_conns[:len(processes)], fast_infer, shared_counter, num_games, shared_data_bases, NUM_WORKERS)
+    test_inference_server(parent_conns, fast_infer, shared_counter, num_games, shared_data_bases, TOTAL_THREADS)
 
     total_aw, total_sw, total_t, total_diff = 0, 0, 0, 0
     for _ in range(NUM_WORKERS):

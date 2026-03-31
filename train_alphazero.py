@@ -5,13 +5,20 @@ import multiprocessing as mp
 import multiprocessing.connection
 import ctypes
 import numpy as np
+import concurrent.futures
 
 from helper import BOARD_SIZE, SHAPES
 
 MAX_ORDER = 10
 _NUM_CPUS = mp.cpu_count()
 NUM_WORKERS = min(31, _NUM_CPUS - 1 if _NUM_CPUS > 1 else 1)
-MAX_CAPACITY = 2048
+
+# 🚀 FIX: Prevent 27 GiB RAM Explosion
+MAX_CAPACITY = 384
+
+# 🚀 MULTITHREADING: 16 Concurrent Games per Worker Process
+NUM_THREADS = 16
+TOTAL_THREADS = NUM_WORKERS * NUM_THREADS
 
 def generate_expert_game(bot):
     states, players = [], []
@@ -56,41 +63,60 @@ def generate_expert_game(bot):
             val_targets.append(1 if team2_score < team1_score else -1)
             score_targets.append(team1_score - team2_score)
 
-    # 🚀 RESTORED TURN TRACKER
     total_turns_played = 84 - sum(len(inv) for inv in inventories.values())
     return states, val_targets, score_targets, total_turns_played
 
-def distributed_train_worker(games_per_worker, conn, result_queue, worker_idx, shared_counter, shared_data_bases, num_workers):
+def single_game_thread(games_per_thread, conn, thread_idx, shared_data_bases, total_threads, shared_counter):
+    from tf_alphazero_bot import ExpertBlokusBot
+    
+    shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((total_threads, MAX_CAPACITY, 20, 20, 8))
+    shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((total_threads, MAX_CAPACITY))
+    shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((total_threads, MAX_CAPACITY))
+    
+    bot = ExpertBlokusBot(pipe=conn, shared_data=(thread_idx, shared_states, shared_values, shared_scores), is_training=True)
+    
+    S, V, SC = [], [], []
+    thread_total_turns = 0 
+    
+    for _ in range(games_per_thread):
+        s, v, sc, turns = generate_expert_game(bot)
+        S.extend(s); V.extend(v); SC.extend(sc)
+        thread_total_turns += turns
+        with shared_counter.get_lock(): shared_counter.value += 1
+            
+    conn.send("DONE")
+    # 🚀 FIX: Explicitly shut down internal MCTS executor to completely stop Thread Stack Memory Leaks
+    if hasattr(bot, 'executor') and bot.executor is not None:
+        bot.executor.shutdown(wait=False)
+    return S, V, SC, thread_total_turns
+
+def distributed_train_worker(games_per_thread, conns, result_queue, thread_indices, shared_counter, shared_data_bases, total_threads):
     os.environ['CUDA_VISIBLE_DEVICES'] = '-1' 
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
     
-    from tf_alphazero_bot import ExpertBlokusBot
-    
-    shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((num_workers, MAX_CAPACITY, 20, 20, 8))
-    shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((num_workers, MAX_CAPACITY))
-    shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((num_workers, MAX_CAPACITY))
-    
-    bot = ExpertBlokusBot(pipe=conn, shared_data=(worker_idx, shared_states, shared_values, shared_scores), is_training=True)
-    
     S, V, SC = [], [], []
-    worker_total_turns = 0 
+    worker_total_turns = 0
     
-    for _ in range(games_per_worker):
-        s, v, sc, turns = generate_expert_game(bot)
-        S.extend(s); V.extend(v); SC.extend(sc)
-        worker_total_turns += turns
-        with shared_counter.get_lock(): shared_counter.value += 1
+    # Run 16 Game Threads parallelly
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(conns)) as executor:
+        futures = []
+        for conn, tid in zip(conns, thread_indices):
+            futures.append(executor.submit(single_game_thread, games_per_thread, conn, tid, shared_data_bases, total_threads, shared_counter))
+        
+        for f in concurrent.futures.as_completed(futures):
+            s, v, sc, turns = f.result()
+            S.extend(s); V.extend(v); SC.extend(sc)
+            worker_total_turns += turns
             
-    conn.send("DONE") 
     result_queue.put((S, V, SC, worker_total_turns))
 
-def training_inference_server(conns, fast_infer, shared_counter, total_games, shared_data_bases, num_workers):
-    shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((num_workers, MAX_CAPACITY, 20, 20, 8))
-    shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((num_workers, MAX_CAPACITY))
-    shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((num_workers, MAX_CAPACITY))
+def training_inference_server(conns, fast_infer, shared_counter, total_games, shared_data_bases, total_threads):
+    shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((total_threads, MAX_CAPACITY, 20, 20, 8))
+    shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((total_threads, MAX_CAPACITY))
+    shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((total_threads, MAX_CAPACITY))
 
     active_conns = list(conns)
-    conn_to_id = {conns[i]: i for i in range(num_workers)}
+    conn_to_id = {conns[i]: i for i in range(total_threads)}
     
     ready_indices, batch_sizes, ready_pipes = [], [], []
     total_states_queued = 0
@@ -100,7 +126,7 @@ def training_inference_server(conns, fast_infer, shared_counter, total_games, sh
     MIN_BATCH_SIZE = 64
 
     print("🔥 Allocating Static Server Buffer in System RAM...", flush=True)
-    MAX_POSSIBLE_BATCH = num_workers * MAX_CAPACITY
+    MAX_POSSIBLE_BATCH = total_threads * MAX_CAPACITY
     SERVER_BUFFER = np.empty((MAX_POSSIBLE_BATCH, 20, 20, 8), dtype=np.float32)
     SERVER_BUFFER.fill(0.0) 
 
@@ -219,8 +245,21 @@ def run_training_pipeline(num_iteration=50):
     print("✅ All dynamic graphs successfully compiled and cached!", flush=True)
     
     TOTAL_GAMES_PER_ITERATION = 1024
-    games_per_worker = max(1, TOTAL_GAMES_PER_ITERATION // NUM_WORKERS)
-    actual_total_games = NUM_WORKERS * games_per_worker
+    games_per_thread = max(1, TOTAL_GAMES_PER_ITERATION // TOTAL_THREADS)
+    actual_total_games = TOTAL_THREADS * games_per_thread
+
+    # 🚀 FIX: Move 2.5 GB allocations outside the loop to prevent Iteration Leaks
+    print("🔥 Allocating Static Inter-Process Communication Arrays (Once)...", flush=True)
+    ctx = mp.get_context('spawn')
+    shared_counter = ctx.Value('i', 0)
+    
+    shared_states_base = mp.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY * 20 * 20 * 8)
+    shared_values_base = mp.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY)
+    shared_scores_base = mp.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY)
+    shared_data_bases = (shared_states_base, shared_values_base, shared_scores_base)
+
+    pipes = [ctx.Pipe() for _ in range(TOTAL_THREADS)]
+    parent_conns, child_conns = [p[0] for p in pipes], [p[1] for p in pipes]
 
     for iteration in range(1, num_iteration + 1):
         print(f"\n" + "="*70, flush=True)
@@ -228,26 +267,20 @@ def run_training_pipeline(num_iteration=50):
         print("="*70, flush=True)
         
         start_time = time.time()
-        ctx = mp.get_context('spawn')
-        
-        shared_counter = ctx.Value('i', 0)
-        shared_states_base = mp.Array(ctypes.c_float, NUM_WORKERS * MAX_CAPACITY * 20 * 20 * 8)
-        shared_values_base = mp.Array(ctypes.c_float, NUM_WORKERS * MAX_CAPACITY)
-        shared_scores_base = mp.Array(ctypes.c_float, NUM_WORKERS * MAX_CAPACITY)
-        shared_data_bases = (shared_states_base, shared_values_base, shared_scores_base)
-
-        pipes = [ctx.Pipe() for _ in range(NUM_WORKERS)]
-        parent_conns, child_conns = [p[0] for p in pipes], [p[1] for p in pipes]
+        shared_counter.value = 0
         
         result_queue = ctx.Queue()
         processes = []
         
         for i in range(NUM_WORKERS):
-            p = ctx.Process(target=distributed_train_worker, args=(games_per_worker, child_conns[i], result_queue, i, shared_counter, shared_data_bases, NUM_WORKERS))
+            conns_for_worker = child_conns[i * NUM_THREADS : (i + 1) * NUM_THREADS]
+            indices_for_worker = list(range(i * NUM_THREADS, (i + 1) * NUM_THREADS))
+            
+            p = ctx.Process(target=distributed_train_worker, args=(games_per_thread, conns_for_worker, result_queue, indices_for_worker, shared_counter, shared_data_bases, TOTAL_THREADS))
             p.start()
             processes.append(p)
 
-        training_inference_server(parent_conns, fast_infer, shared_counter, actual_total_games, shared_data_bases, NUM_WORKERS)
+        training_inference_server(parent_conns, fast_infer, shared_counter, actual_total_games, shared_data_bases, TOTAL_THREADS)
 
         S, V, SC = [], [], []
         iteration_total_turns = 0
@@ -262,7 +295,7 @@ def run_training_pipeline(num_iteration=50):
         generation_time = time.time() - start_time
         avg_game_length = iteration_total_turns / actual_total_games
         
-        print(f"\n✅ Data Generation Complete in {generation_time:.1f}s | Saved States: {len(S)} | EXACT Avg Turns/Game: {avg_game_length:.1f}", flush=True)
+        print(f"\n✅ Data Gen Complete in {generation_time:.1f}s | Saved States: {len(S)} | EXACT Avg Turns/Game: {avg_game_length:.1f}", flush=True)
         print(f"🧠 Constructing tf.data.Dataset Pipeline...", flush=True)
 
         dataset = tf.data.Dataset.from_tensor_slices((np.array(S, dtype=np.float32), {'value': np.array(V, dtype=np.float32), 'score_lead': np.array(SC, dtype=np.float32)}))
