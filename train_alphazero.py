@@ -219,7 +219,7 @@ def run_training_pipeline(num_iteration=50):
         _ = fast_infer(tf.zeros((p, 20, 20, 8), dtype=tf.float32))
     print("✅ All dynamic graphs successfully compiled and cached!", flush=True)
     
-    TOTAL_GAMES_PER_ITERATION = 31
+    TOTAL_GAMES_PER_ITERATION = 1024
     games_per_worker = max(1, TOTAL_GAMES_PER_ITERATION // NUM_WORKERS)
     actual_total_games = NUM_WORKERS * games_per_worker
 
