@@ -65,7 +65,8 @@ def distributed_test_worker(games_per_worker, conn, result_queue, worker_idx, sh
     
     from tf_alphazero_bot import ExpertBlokusBot
     
-    shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((num_workers, MAX_CAPACITY, 20, 20, 6))
+    # 🚀 TENSOR CORE OPTIMIZATION: Channels bumped to 8
+    shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((num_workers, MAX_CAPACITY, 20, 20, 8))
     shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((num_workers, MAX_CAPACITY))
     shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((num_workers, MAX_CAPACITY))
     
@@ -86,7 +87,8 @@ def distributed_test_worker(games_per_worker, conn, result_queue, worker_idx, sh
 def test_inference_server(conns, fast_infer, shared_counter, total_games, shared_data_bases, num_workers):
     import tensorflow as tf
     
-    shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((num_workers, MAX_CAPACITY, 20, 20, 6))
+    # 🚀 TENSOR CORE OPTIMIZATION: Channels bumped to 8
+    shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((num_workers, MAX_CAPACITY, 20, 20, 8))
     shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((num_workers, MAX_CAPACITY))
     shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((num_workers, MAX_CAPACITY))
 
@@ -98,10 +100,12 @@ def test_inference_server(conns, fast_infer, shared_counter, total_games, shared
     last_print_time = time.time()
     
     CHUNK_SIZE = 2 ** MAX_ORDER
+    MIN_BATCH_SIZE = 64
 
     print("🔥 Allocating Static Server Buffer in System RAM...", flush=True)
     MAX_POSSIBLE_BATCH = num_workers * MAX_CAPACITY
-    SERVER_BUFFER = np.empty((MAX_POSSIBLE_BATCH, 20, 20, 6), dtype=np.float32)
+    # 🚀 TENSOR CORE OPTIMIZATION: Channels bumped to 8
+    SERVER_BUFFER = np.empty((MAX_POSSIBLE_BATCH, 20, 20, 8), dtype=np.float32)
     SERVER_BUFFER.fill(0.0)
 
     while active_conns:
@@ -133,23 +137,31 @@ def test_inference_server(conns, fast_infer, shared_counter, total_games, shared
             t1 = time.time()
             v_preds, sc_preds = [], []
             
-            sizes = []
-            rem = actual_size
-            while rem > 0:
-                if rem >= CHUNK_SIZE:
-                    p = CHUNK_SIZE
-                else:
-                    p = 1 << (rem.bit_length() - 1)
-                sizes.append(p)
-                rem -= p
-                
             tensor_cursor = 0
-            for p in sizes:
-                chunk = batch_tensor[tensor_cursor : tensor_cursor + p]
-                preds = fast_infer(chunk)
-                v_preds.append(preds[0].numpy().flatten())
-                sc_preds.append(preds[1].numpy().flatten())
-                tensor_cursor += p
+            rem = actual_size
+            
+            while rem > 0:
+                curr_size = min(rem, CHUNK_SIZE)
+                
+                pad_target = 1 << (curr_size - 1).bit_length() if curr_size > 0 else 0
+                if pad_target < MIN_BATCH_SIZE: 
+                    pad_target = MIN_BATCH_SIZE
+                
+                chunk = batch_tensor[tensor_cursor : tensor_cursor + curr_size]
+                
+                if pad_target > curr_size:
+                    # 🚀 TENSOR CORE OPTIMIZATION: Channels bumped to 8
+                    pad_array = np.zeros((pad_target - curr_size, 20, 20, 8), dtype=np.float32)
+                    chunk_padded = np.concatenate([chunk, pad_array], axis=0)
+                else:
+                    chunk_padded = chunk
+                    
+                preds = fast_infer(chunk_padded)
+                v_preds.append(preds[0].numpy().flatten()[:curr_size])
+                sc_preds.append(preds[1].numpy().flatten()[:curr_size])
+                
+                tensor_cursor += curr_size
+                rem -= curr_size
                 
             t_infer = (time.time() - t1) * 1000 
             t_per_sample = (t_infer / actual_size) if actual_size > 0 else 0.0
@@ -172,7 +184,7 @@ def test_inference_server(conns, fast_infer, shared_counter, total_games, shared
                 games_remaining = total_games - shared_counter.value
                 print(f"⚡ GPU INFERENCE | Batch: {actual_size:<5} | "
                       f"Copy: {t_copy:>5.1f}ms | "
-                      f"Infer: {t_infer:>5.1f}ms ({t_per_sample:>4.2f}ms/st) | "
+                      f"Infer: {t_infer:>5.1f}ms ({t_per_sample:>4.4f}ms/st) | "
                       f"Write: {t_write:>5.1f}ms | "
                       f"Remaining: {games_remaining:<4} ", end='\r', flush=True)
                 last_print_time = curr_time
@@ -185,7 +197,6 @@ def test_inference_server(conns, fast_infer, shared_counter, total_games, shared
 def test_model(num_games=124):
     import tensorflow as tf
     
-    # 🚀 ENABLE MIXED PRECISION (FLOAT16)
     tf.keras.mixed_precision.set_global_policy('mixed_float16')
 
     keras_path = "blokus_expert_latest.keras"
@@ -203,13 +214,15 @@ def test_model(num_games=124):
     print(f"Warming up TensorFlow Graph Compiler for {keras_path}...")
     model = tf.keras.models.load_model(keras_path, compile=False)
     
-    @tf.function(reduce_retracing=True)
+    @tf.function(reduce_retracing=True, jit_compile=True)
     def fast_infer(batch_tensor): 
         return model(batch_tensor, training=False)
 
-    print(f"🔥 Pre-compiling Power-of-2 XLA Buckets (1 to {MAX_CAPACITY}) into System RAM...")
-    for o in range(MAX_ORDER + 1):
-        _ = fast_infer(tf.zeros((2 ** o, 20, 20, 6), dtype=tf.float32))
+    print(f"🔥 Pre-compiling Power-of-2 XLA Buckets (64 to {MAX_CAPACITY}) into System RAM...")
+    for p in [64, 128, 256, 512, 1024, 2048]:
+        if p > 2 ** MAX_ORDER: break
+        # 🚀 TENSOR CORE OPTIMIZATION: Channels bumped to 8
+        _ = fast_infer(tf.zeros((p, 20, 20, 8), dtype=tf.float32))
     print("✅ All dynamic graphs successfully compiled and cached!")
 
     print("="*60)
@@ -220,7 +233,8 @@ def test_model(num_games=124):
     ctx = mp.get_context('spawn')
     
     shared_counter = ctx.Value('i', 0)
-    shared_states_base = mp.Array(ctypes.c_float, NUM_WORKERS * MAX_CAPACITY * 20 * 20 * 6)
+    # 🚀 TENSOR CORE OPTIMIZATION: Channels bumped to 8
+    shared_states_base = mp.Array(ctypes.c_float, NUM_WORKERS * MAX_CAPACITY * 20 * 20 * 8)
     shared_values_base = mp.Array(ctypes.c_float, NUM_WORKERS * MAX_CAPACITY)
     shared_scores_base = mp.Array(ctypes.c_float, NUM_WORKERS * MAX_CAPACITY)
     shared_data_bases = (shared_states_base, shared_values_base, shared_scores_base)

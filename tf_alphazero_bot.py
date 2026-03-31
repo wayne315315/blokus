@@ -4,8 +4,7 @@ import math
 from helper import BOARD_SIZE, SHAPES, is_valid_move, rotate_shape, flip_shape
 
 class AdvancedBlokusModel:
-    #def __init__(self, board_size=20, num_blocks=10, filters=128):
-    def __init__(self, board_size=20, num_blocks=2, filters=16):
+    def __init__(self, board_size=20, num_blocks=4, filters=16):
         self.board_size = board_size
         self.num_blocks = num_blocks
         self.filters = filters
@@ -15,8 +14,8 @@ class AdvancedBlokusModel:
         import tensorflow as tf
         from tensorflow.keras import layers, models
 
-        # Inputs start as float32; the mixed precision policy will automatically cast them downward
-        inputs = layers.Input(shape=(self.board_size, self.board_size, 6))
+        # 🚀 TENSOR CORE OPTIMIZATION: Channels bumped from 6 to 8
+        inputs = layers.Input(shape=(self.board_size, self.board_size, 8))
 
         x = layers.Conv2D(self.filters, 3, padding='same', use_bias=False)(inputs)
         x = layers.BatchNormalization()(x)
@@ -43,7 +42,6 @@ class AdvancedBlokusModel:
         v = layers.Activation('relu')(v)
         v = layers.Flatten()(v)
         v = layers.Dense(256, activation='relu')(v)
-        # 🛑 MIXED PRECISION REQUIREMENT: Final output must be float32 for numerical stability!
         value_out = layers.Dense(1, activation='tanh', name='value', dtype='float32')(v)
 
         s = layers.Conv2D(1, 1, padding='same', use_bias=False)(x)
@@ -51,7 +49,6 @@ class AdvancedBlokusModel:
         s = layers.Activation('relu')(s)
         s = layers.Flatten()(s)
         s = layers.Dense(256, activation='relu')(s)
-        # 🛑 MIXED PRECISION REQUIREMENT: Final output must be float32 for numerical stability!
         score_out = layers.Dense(1, name='score_lead', dtype='float32')(s)  
 
         model = models.Model(inputs=inputs, outputs=[value_out, score_out])
@@ -114,13 +111,11 @@ class ExpertBlokusBot:
             search_path = [node]
             colors_in_path = [color]
             
-            # Dynamic Running State
             curr_board = [row[:] for row in board]
             curr_inv = {k: list(v) for k, v in inventories.items()}
             curr_first = dict(first_moves)
             curr_color = color
             
-            # Selection Phase
             while node.is_expanded():
                 best_score = -float('inf')
                 best_action = None
@@ -134,7 +129,6 @@ class ExpertBlokusBot:
                 node = best_child
                 search_path.append(node)
                 
-                # Apply action to dynamic state
                 shape_name, coords = best_action[1], best_action[5]
                 for r, c in coords: curr_board[r][c] = curr_color
                 curr_inv[curr_color].remove(shape_name)
@@ -142,14 +136,12 @@ class ExpertBlokusBot:
                 curr_color = (curr_color % 4) + 1
                 colors_in_path.append(curr_color)
 
-            # Expansion Phase
             node_legal_moves = self._get_legal_moves(curr_board, curr_color, curr_inv, curr_first)
             if node_legal_moves:
                 v_leaf = self._expand_and_evaluate(node, curr_board, curr_color, curr_inv, curr_first, node_legal_moves)
             else:
                 v_leaf = node.q_value() 
 
-            # Backpropagation Phase
             for n, step_color in zip(search_path, colors_in_path):
                 n.visit_count += 1
                 if (step_color % 2) == (curr_color % 2):
@@ -214,7 +206,8 @@ class ExpertBlokusBot:
         return np.max(q_values) 
 
     def _build_state_tensor(self, board, color, inventories, first_moves):
-        tensor = np.zeros((BOARD_SIZE, BOARD_SIZE, 6), dtype=np.float32)
+        # 🚀 TENSOR CORE OPTIMIZATION: Zero-padded up to 8 channels
+        tensor = np.zeros((BOARD_SIZE, BOARD_SIZE, 8), dtype=np.float32)
         board_np = np.array(board)
         for p in range(1, 5): tensor[:, :, p-1] = (board_np == p).astype(np.float32)
         tensor[:, :, 4] = color / 4.0
