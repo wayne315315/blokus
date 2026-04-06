@@ -14,10 +14,10 @@ _NUM_CPUS = mp.cpu_count()
 NUM_WORKERS = min(31, _NUM_CPUS - 1 if _NUM_CPUS > 1 else 1)
 
 # 🚀 FIX: Prevent 27 GiB RAM Explosion
-MAX_CAPACITY = 384
+MAX_CAPACITY = 2048
 
-# 🚀 MULTITHREADING: 16 Concurrent Games per Worker Process
-NUM_THREADS = 16
+# 🚀 MULTITHREADING: 4 Concurrent Games per Worker Process
+NUM_THREADS = 4
 TOTAL_THREADS = NUM_WORKERS * NUM_THREADS
 
 def generate_expert_game(bot):
@@ -97,7 +97,7 @@ def distributed_train_worker(games_per_thread, conns, result_queue, thread_indic
     S, V, SC = [], [], []
     worker_total_turns = 0
     
-    # Run 16 Game Threads parallelly
+    # Run 4 Game Threads parallelly
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(conns)) as executor:
         futures = []
         for conn, tid in zip(conns, thread_indices):

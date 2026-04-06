@@ -12,8 +12,8 @@ from player import BotPlayer
 MAX_ORDER = 10
 _NUM_CPUS = mp.cpu_count()
 NUM_WORKERS = min(31, _NUM_CPUS - 1 if _NUM_CPUS > 1 else 1)
-MAX_CAPACITY = 512
-NUM_THREADS = 16
+MAX_CAPACITY = 2048
+NUM_THREADS = 1
 TOTAL_THREADS = NUM_WORKERS * NUM_THREADS
 
 def play_test_game(adv_bot, std_bot_1, std_bot_2, play_as_first):
