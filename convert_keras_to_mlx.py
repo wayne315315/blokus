@@ -12,11 +12,9 @@ tf_model = tf.keras.models.load_model("blokus_expert_latest.keras", compile=Fals
 # ==========================================
 print("Extracting matrices by physical shape...")
 
-# Conv2D and BatchNorm are strictly sequential in your architecture
 conv_weights = [l.get_weights()[0] for l in tf_model.layers if type(l).__name__ == 'Conv2D']
 bn_weights = [l.get_weights() for l in tf_model.layers if type(l).__name__ == 'BatchNormalization']
 
-# Isolate Dense layers based on their mathematical shape
 dense_layers = [l for l in tf_model.layers if type(l).__name__ == 'Dense']
 dense_16 = [l.get_weights() for l in dense_layers if l.get_weights()[0].shape[0] == 16]
 dense_400 = [l.get_weights() for l in dense_layers if l.get_weights()[0].shape[0] == 400]
@@ -29,19 +27,20 @@ print(f"Extracted {len(dense_400)} Head Hidden Dense matrices. (Expected: 2)")
 print(f"Extracted {len(dense_256)} Head Output Dense matrices. (Expected: 2)")
 
 # ==========================================
-# 2. Formatting Helpers (TF -> MLX)
+# 2. Formatting Helpers (TF -> MLX float16)
 # ==========================================
 def fmt_conv(w): 
-    # TF: (H, W, in_C, out_C) -> MLX: (out_C, H, W, in_C)
-    return mx.array(w.transpose(3, 0, 1, 2))
+    # 🍏 Cast immediately to float16
+    return mx.array(w.transpose(3, 0, 1, 2), dtype=mx.float16)
 
 def fmt_bn(w): 
-    return mx.array(w[0]), mx.array(w[1]), mx.array(w[2]), mx.array(w[3])
+    # 🍏 Cast all BatchNorm parameters to float16
+    return mx.array(w[0], dtype=mx.float16), mx.array(w[1], dtype=mx.float16), mx.array(w[2], dtype=mx.float16), mx.array(w[3], dtype=mx.float16)
 
 def fmt_dense(w, use_bias=True):
-    # TF: (in, out) -> MLX: (out, in)
-    mw = mx.array(w[0].transpose(1, 0))
-    if use_bias: return mw, mx.array(w[1])
+    # 🍏 Cast Dense matrices and biases to float16
+    mw = mx.array(w[0].transpose(1, 0), dtype=mx.float16)
+    if use_bias: return mw, mx.array(w[1], dtype=mx.float16)
     return mw
 
 # ==========================================
@@ -73,11 +72,9 @@ params.append(("conv_v.weight", fmt_conv(conv_weights.pop(0))))
 g, b, m, v = fmt_bn(bn_weights.pop(0))
 params.extend([("bn_v.weight", g), ("bn_v.bias", b), ("bn_v.running_mean", m), ("bn_v.running_var", v)])
 
-# Hidden Dense (400x256)
 w, bias = fmt_dense(dense_400.pop(0), use_bias=True)
 params.extend([("dense_v1.weight", w), ("dense_v1.bias", bias)])
 
-# Output Dense (256x1)
 w, bias = fmt_dense(dense_256.pop(0), use_bias=True)
 params.extend([("dense_v2.weight", w), ("dense_v2.bias", bias)])
 
@@ -86,11 +83,9 @@ params.append(("conv_s.weight", fmt_conv(conv_weights.pop(0))))
 g, b, m, v = fmt_bn(bn_weights.pop(0))
 params.extend([("bn_s.weight", g), ("bn_s.bias", b), ("bn_s.running_mean", m), ("bn_s.running_var", v)])
 
-# Hidden Dense (400x256)
 w, bias = fmt_dense(dense_400.pop(0), use_bias=True)
 params.extend([("dense_s1.weight", w), ("dense_s1.bias", bias)])
 
-# Output Dense (256x1)
 w, bias = fmt_dense(dense_256.pop(0), use_bias=True)
 params.extend([("dense_s2.weight", w), ("dense_s2.bias", bias)])
 
@@ -145,8 +140,6 @@ class MLXBlokusModel(nn.Module):
 mlx_model = MLXBlokusModel()
 mlx_model.update(tree_unflatten(params))
 
-# Force evaluation to guarantee arrays are allocated in Unified Memory
 mx.eval(mlx_model.parameters())
-
 mlx_model.save_weights("blokus_expert_latest.safetensors")
-print("✅ Conversion successfully completed! Saved as blokus_expert_latest.safetensors")
+print("✅ Conversion successfully completed! Saved as blokus_expert_latest.safetensors (Native FP16)")

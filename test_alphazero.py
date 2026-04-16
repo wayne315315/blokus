@@ -192,8 +192,11 @@ def test_inference_server(conns, fast_infer, shared_counter, total_games, shared
             
             while tensor_cursor < actual_size:
                 curr_size = min(actual_size - tensor_cursor, CHUNK_SIZE)
+                
+                # 🍏 16-BIT PRECISION INJECTION
                 if curr_size == CHUNK_SIZE:
-                    pred_v, pred_s = fast_infer(mx.array(batch_tensor[tensor_cursor : tensor_cursor + curr_size]))
+                    chunk_input = mx.array(batch_tensor[tensor_cursor : tensor_cursor + curr_size], dtype=mx.float16)
+                    pred_v, pred_s = fast_infer(chunk_input)
                 else:
                     pad_target = 1 << (curr_size - 1).bit_length() if curr_size > 0 else 0
                     if pad_target < MIN_BATCH_SIZE: pad_target = MIN_BATCH_SIZE
@@ -202,9 +205,11 @@ def test_inference_server(conns, fast_infer, shared_counter, total_games, shared
                     if pad_target > curr_size:
                         pad_array = np.zeros((pad_target - curr_size, 20, 20, 8), dtype=np.float32)
                         chunk_padded = np.concatenate([chunk, pad_array], axis=0)
-                        pred_v, pred_s = fast_infer(mx.array(chunk_padded))
+                        chunk_input = mx.array(chunk_padded, dtype=mx.float16)
+                        pred_v, pred_s = fast_infer(chunk_input)
                     else:
-                        pred_v, pred_s = fast_infer(mx.array(chunk))
+                        chunk_input = mx.array(chunk, dtype=mx.float16)
+                        pred_v, pred_s = fast_infer(chunk_input)
                 
                 mx.eval(pred_v, pred_s)
                 v_preds.append(np.array(pred_v).flatten()[:curr_size])
@@ -251,16 +256,20 @@ def test_model(num_games=124):
     print(f"Warming up MLX Graph Compiler for {model_path}...")
     model = MLXAdvancedBlokusModel()
     model.load_weights(model_path)
+    
+    # 🍏 FORCE FLOAT16 PRECISION
+    # We cast after loading to ensure all parameters map cleanly to the 16-bit register space
+    model.set_dtype(mx.float16)
     model.eval()
     
-    # 🍏 Model is captured from closure, not passed as argument
     @mx.compile
     def fast_infer(batch_tensor): 
         return model(batch_tensor)
 
     print(f"🔥 Pre-compiling Power-of-2 XLA Buckets (64 to {2 ** MAX_ORDER}) into System RAM...")
     for p in range(6, MAX_ORDER + 1):
-        dummy = mx.zeros((2 ** p, 20, 20, 8), dtype=mx.float32)
+        # 🍏 Dummy tensor must match the float16 precision
+        dummy = mx.zeros((2 ** p, 20, 20, 8), dtype=mx.float16)
         v, s = fast_infer(dummy)
         mx.eval(v, s)
     print("✅ All dynamic graphs successfully compiled and cached!")

@@ -12,8 +12,6 @@ import concurrent.futures
 
 class AdvancedBlokusModel:
     def __init__(self, board_size=20, num_blocks=4, filters=16):
-        # TensorFlow removed. The model is passed externally now.
-        # Keeping this initialization for interface compatibility.
         self.board_size = board_size
         self.num_blocks = num_blocks
         self.filters = filters
@@ -128,8 +126,6 @@ cdef class ExpertBlokusBot:
         self.is_training = is_training
         self.c_puct = 1.5
         self.pipe_lock = threading.Lock()
-        
-        # 🚀 FIX: Persistent executor to prevent RAM thread stack fragmentation
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
         self.shape_keys = list(SHAPES.keys())
@@ -319,7 +315,7 @@ cdef class ExpertBlokusBot:
         cdef int batch_size = len(after_states)
         cdef np.ndarray values = np.zeros(batch_size, dtype=np.float32)
         cdef int i, chunk_start, chunk_end, chunk_size
-        cdef int max_cap = 256  # 🚀 Pipe Chunk Limit
+        cdef int max_cap = 256
         
         if self.shared_data is not None:
             w_id, s_states, s_values, s_scores = self.shared_data
@@ -335,9 +331,10 @@ cdef class ExpertBlokusBot:
                     values[chunk_start:chunk_end] = s_values[w_id, :chunk_size].copy()
         else:
             with self.pipe_lock:
-                # 🚀 Direct MLX call for single-threaded testing
                 import mlx.core as mx
-                v, s = self.model(mx.array(after_states))
+                # 🍏 16-BIT PRECISION INJECTION
+                # We cast the Python/Numpy list directly to mx.float16 before feeding it to the model.
+                v, s = self.model(mx.array(after_states, dtype=mx.float16))
                 mx.eval(v)
                 values = np.array(v).flatten()
 

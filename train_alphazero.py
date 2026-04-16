@@ -20,7 +20,6 @@ threading.stack_size(256 * 1024)
 
 from helper import BOARD_SIZE, SHAPES
 
-# Exactly matching your previous parameters
 MAX_ORDER = 10
 _NUM_CPUS = mp.cpu_count()
 NUM_WORKERS = min(31, _NUM_CPUS - 1 if _NUM_CPUS > 1 else 1)
@@ -29,12 +28,11 @@ NUM_THREADS = 4
 TOTAL_THREADS = NUM_WORKERS * NUM_THREADS
 
 # ==========================================
-# 🍏 1. MLX Neural Network Architecture
+# 1. MLX Neural Network Architecture
 # ==========================================
 class ResidualBlock(nn.Module):
     def __init__(self, filters):
         super().__init__()
-        # MLX Conv2d defaults to NHWC, seamlessly integrating with Numpy!
         self.conv1 = nn.Conv2d(filters, filters, 3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm(filters)
         self.conv2 = nn.Conv2d(filters, filters, 3, padding=1, bias=False)
@@ -45,7 +43,6 @@ class ResidualBlock(nn.Module):
         shortcut = x
         x = nn.relu(self.bn1(self.conv1(x)))
         x = self.bn2(self.conv2(x))
-        # Global Average Pooling (NHWC -> Average over axes 1, 2)
         g = x.mean(axis=(1, 2))
         g = self.dense_g(g).reshape(g.shape[0], 1, 1, g.shape[1])
         x = x + g + shortcut
@@ -86,7 +83,7 @@ class MLXAdvancedBlokusModel(nn.Module):
         return value_out, score_out
 
 # ==========================================
-# 🍏 2. Loss Functions and Training Step
+# 2. Loss Functions (No global compilation)
 # ==========================================
 def huber_loss(predictions, targets, delta=1.0):
     error = predictions - targets
@@ -101,20 +98,8 @@ def loss_fn(model, x, y_val, y_score):
     loss_s = huber_loss(pred_score, y_score)
     return loss_v + 0.05 * loss_s
 
-@mx.compile
-def train_step(model, optimizer, x, y_val, y_score):
-    loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
-    loss, grads = loss_and_grad_fn(model, x, y_val, y_score)
-    optimizer.update(model, grads)
-    return loss
-
-@mx.compile
-def fast_infer(model, batch_tensor): 
-    # MLX JIT Inference
-    return model(batch_tensor)
-
 # ==========================================
-# 3. Game Generation and Worker Logic (Fully Retained)
+# 3. Game Generation & Workers
 # ==========================================
 def generate_expert_game(bot):
     states, players = [], []
@@ -196,7 +181,10 @@ def distributed_train_worker(games_per_thread, conns, result_queue, thread_indic
             worker_total_turns += turns
     result_queue.put((S, V, SC, worker_total_turns))
 
-def training_inference_server(model, conns, shared_counter, total_games, shared_data_bases, total_threads):
+# ==========================================
+# 4. Inference Server
+# ==========================================
+def training_inference_server(conns, fast_infer, shared_counter, total_games, shared_data_bases, total_threads):
     shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((total_threads, MAX_CAPACITY, 20, 20, 8))
     shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((total_threads, MAX_CAPACITY))
     shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((total_threads, MAX_CAPACITY))
@@ -247,9 +235,10 @@ def training_inference_server(model, conns, shared_counter, total_games, shared_
             while tensor_cursor < actual_size:
                 curr_size = min(actual_size - tensor_cursor, CHUNK_SIZE)
                 
+                # 🍏 16-BIT PRECISION INJECTION
                 if curr_size == CHUNK_SIZE:
-                    # 🍏 MLX Zero-Copy: mx.array() accesses RAM directly on Mac, no transfer overhead
-                    pred_v, pred_s = fast_infer(model, mx.array(batch_tensor[tensor_cursor : tensor_cursor + curr_size]))
+                    chunk_input = mx.array(batch_tensor[tensor_cursor : tensor_cursor + curr_size], dtype=mx.float16)
+                    pred_v, pred_s = fast_infer(chunk_input)
                 else:
                     pad_target = 1 << (curr_size - 1).bit_length() if curr_size > 0 else 0
                     if pad_target < MIN_BATCH_SIZE: pad_target = MIN_BATCH_SIZE
@@ -258,13 +247,14 @@ def training_inference_server(model, conns, shared_counter, total_games, shared_
                     if pad_target > curr_size:
                         pad_array = np.zeros((pad_target - curr_size, 20, 20, 8), dtype=np.float32)
                         chunk_padded = np.concatenate([chunk, pad_array], axis=0)
-                        pred_v, pred_s = fast_infer(model, mx.array(chunk_padded))
+                        chunk_input = mx.array(chunk_padded, dtype=mx.float16)
+                        pred_v, pred_s = fast_infer(chunk_input)
                     else:
-                        pred_v, pred_s = fast_infer(model, mx.array(chunk))
+                        chunk_input = mx.array(chunk, dtype=mx.float16)
+                        pred_v, pred_s = fast_infer(chunk_input)
                 
-                # MLX uses Lazy Evaluation, force execution
                 mx.eval(pred_v, pred_s)
-                
+                # Results come back as float16 numpy arrays, which implicitly upcast back to our float32 buffer
                 v_numpy[tensor_cursor : tensor_cursor + curr_size] = np.array(pred_v).flatten()[:curr_size]
                 sc_numpy[tensor_cursor : tensor_cursor + curr_size] = np.array(pred_s).flatten()[:curr_size]
                 tensor_cursor += curr_size
@@ -296,23 +286,45 @@ def training_inference_server(model, conns, shared_counter, total_games, shared_
             
     print("\n✅ All GPU processes finished gathering data.", flush=True)
 
+# ==========================================
+# 5. Main Training Pipeline
+# ==========================================
 def run_training_pipeline(num_iteration=1000):
     model = MLXAdvancedBlokusModel()
-    optimizer = optim.Adam(learning_rate=2e-4)
-
+    
     weights_path = "blokus_expert_latest.safetensors"
     optim_path = "blokus_expert_optim.safetensors"
 
     if os.path.exists(weights_path):
         print(f"🚀 Found existing model! Resuming training from {weights_path}...", flush=True)
         model.load_weights(weights_path)
-        if os.path.exists(optim_path):
-            optimizer.load_state(optim_path)
+    
+    # 🍏 FORCE FLOAT16 PRECISION
+    # We cast after loading to ensure all weights reside in memory as 16-bit floats
+    model.set_dtype(mx.float16)
+
+    optimizer = optim.Adam(learning_rate=2e-4)
+    if os.path.exists(optim_path):
+        optimizer.load_state(optim_path)
+
+    # 🍏 Compile closures correctly
+    loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+    
+    @mx.compile
+    def train_step(x, y_val, y_score):
+        loss, grads = loss_and_grad_fn(model, x, y_val, y_score)
+        optimizer.update(model, grads)
+        return loss
+
+    @mx.compile
+    def fast_infer(batch_tensor): 
+        return model(batch_tensor)
 
     print(f"🔥 Pre-compiling MLX Power-of-2 Buckets (64 to {2 ** MAX_ORDER}) into System RAM...", flush=True)
     for o in range(6, MAX_ORDER + 1):
-        dummy = mx.zeros((2 ** o, 20, 20, 8), dtype=mx.float32)
-        v, s = fast_infer(model, dummy)
+        # 🍏 Dummy tensor must match the float16 precision
+        dummy = mx.zeros((2 ** o, 20, 20, 8), dtype=mx.float16)
+        v, s = fast_infer(dummy)
         mx.eval(v, s)
     print("✅ All dynamic graphs successfully compiled via @mx.compile!", flush=True)
     
@@ -372,7 +384,7 @@ def run_training_pipeline(num_iteration=1000):
             p.start()
             processes.append(p)
 
-        training_inference_server(model, parent_conns, shared_counter, actual_total_games, shared_data_bases, TOTAL_THREADS)
+        training_inference_server(parent_conns, fast_infer, shared_counter, actual_total_games, shared_data_bases, TOTAL_THREADS)
 
         S, V, SC = [], [], []
         iteration_total_turns = 0
@@ -395,7 +407,6 @@ def run_training_pipeline(num_iteration=1000):
         current_buffer_size = len(replay_states)
         print(f"🧠 Replay Buffer Size: {current_buffer_size} / {REPLAY_BUFFER_SIZE}. Training on MLX...", flush=True)
 
-        # 🍏 MLX Manual Batch Training Loop
         batch_size = 64
         epochs = 4
         
@@ -413,12 +424,13 @@ def run_training_pipeline(num_iteration=1000):
             
             for i in range(0, current_buffer_size, batch_size):
                 batch_idx = indices[i:i+batch_size]
-                # Numpy to MLX Array (Zero-Copy)
-                batch_x = mx.array(np_states[batch_idx])
-                batch_yv = mx.array(np_values[batch_idx])
-                batch_ys = mx.array(np_scores[batch_idx])
                 
-                loss = train_step(model, optimizer, batch_x, batch_yv, batch_ys)
+                # 🍏 explicitly cast training inputs to float16
+                batch_x = mx.array(np_states[batch_idx], dtype=mx.float16)
+                batch_yv = mx.array(np_values[batch_idx], dtype=mx.float16)
+                batch_ys = mx.array(np_scores[batch_idx], dtype=mx.float16)
+                
+                loss = train_step(batch_x, batch_yv, batch_ys)
                 mx.eval(loss, model.parameters(), optimizer.state)
                 epoch_loss += loss.item()
                 num_batches += 1
