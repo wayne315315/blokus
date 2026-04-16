@@ -6,6 +6,9 @@ import ctypes
 import numpy as np
 import concurrent.futures
 
+import mlx.core as mx
+import mlx.nn as nn
+
 from helper import BOARD_SIZE, SHAPES
 from player import BotPlayer  
 
@@ -15,6 +18,51 @@ NUM_WORKERS = min(31, _NUM_CPUS - 1 if _NUM_CPUS > 1 else 1)
 MAX_CAPACITY = 2048
 NUM_THREADS = 1
 TOTAL_THREADS = NUM_WORKERS * NUM_THREADS
+
+class ResidualBlock(nn.Module):
+    def __init__(self, filters):
+        super().__init__()
+        self.conv1 = nn.Conv2d(filters, filters, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm(filters)
+        self.conv2 = nn.Conv2d(filters, filters, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm(filters)
+        self.dense_g = nn.Linear(filters, filters, bias=False)
+
+    def __call__(self, x):
+        shortcut = x
+        x = nn.relu(self.bn1(self.conv1(x)))
+        x = self.bn2(self.conv2(x))
+        g = x.mean(axis=(1, 2))
+        g = self.dense_g(g).reshape(g.shape[0], 1, 1, g.shape[1])
+        return nn.relu(x + g + shortcut)
+
+class MLXAdvancedBlokusModel(nn.Module):
+    def __init__(self, board_size=20, num_blocks=4, filters=16):
+        super().__init__()
+        self.conv_init = nn.Conv2d(8, filters, 3, padding=1, bias=False)
+        self.bn_init = nn.BatchNorm(filters)
+        self.res_blocks = [ResidualBlock(filters) for _ in range(num_blocks)]
+        self.conv_v = nn.Conv2d(filters, 1, 1, padding=0, bias=False)
+        self.bn_v = nn.BatchNorm(1)
+        self.dense_v1 = nn.Linear(board_size * board_size * 1, 256)
+        self.dense_v2 = nn.Linear(256, 1)
+        self.conv_s = nn.Conv2d(filters, 1, 1, padding=0, bias=False)
+        self.bn_s = nn.BatchNorm(1)
+        self.dense_s1 = nn.Linear(board_size * board_size * 1, 256)
+        self.dense_s2 = nn.Linear(256, 1)
+
+    def __call__(self, x):
+        x = nn.relu(self.bn_init(self.conv_init(x)))
+        for block in self.res_blocks: x = block(x)
+        v = nn.relu(self.bn_v(self.conv_v(x)))
+        v = v.reshape(v.shape[0], -1)
+        v = nn.relu(self.dense_v1(v))
+        value_out = mx.tanh(self.dense_v2(v))
+        s = nn.relu(self.bn_s(self.conv_s(x)))
+        s = s.reshape(s.shape[0], -1)
+        s = nn.relu(self.dense_s1(s))
+        score_out = self.dense_s2(s)
+        return value_out, score_out
 
 def play_test_game(adv_bot, std_bot_1, std_bot_2, play_as_first):
     board = [[0 for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
@@ -29,7 +77,6 @@ def play_test_game(adv_bot, std_bot_1, std_bot_2, play_as_first):
 
     while pass_count < 4:
         active_bot = color_map[current_color]
-        
         if active_bot.__class__.__name__ == 'ExpertBlokusBot':
             shape_name, coords = active_bot.get_play(board, current_color, inventories, first_moves, pass_count)
         else:
@@ -85,15 +132,11 @@ def single_thread_task(games_per_thread, conn, thread_idx, shared_data_bases, to
     return az_wins, std_wins, ties, az_score_diff
 
 def distributed_test_worker(games_per_thread, worker_conns, result_queue, worker_thread_ids, shared_counter, shared_data_bases, total_threads):
-    os.environ['CUDA_VISIBLE_DEVICES'] = '-1' 
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
-    
     az_wins, std_wins, ties, az_score_diff = 0, 0, 0, 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(worker_conns)) as executor:
         futures = []
         for conn, tid in zip(worker_conns, worker_thread_ids):
             futures.append(executor.submit(single_thread_task, games_per_thread, conn, tid, shared_data_bases, total_threads, shared_counter))
-            
         for f in concurrent.futures.as_completed(futures):
             aw, sw, t, diff = f.result()
             az_wins += aw; std_wins += sw; ties += t; az_score_diff += diff
@@ -101,15 +144,12 @@ def distributed_test_worker(games_per_thread, worker_conns, result_queue, worker
     result_queue.put([az_wins, std_wins, ties, az_score_diff])
 
 def test_inference_server(conns, fast_infer, shared_counter, total_games, shared_data_bases, total_threads):
-    import tensorflow as tf
-    
     shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((total_threads, MAX_CAPACITY, 20, 20, 8))
     shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((total_threads, MAX_CAPACITY))
     shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((total_threads, MAX_CAPACITY))
 
     active_conns = list(conns)
     conn_to_id = {conns[i]: i for i in range(total_threads)}
-    
     ready_indices, batch_sizes, ready_pipes = [], [], []
     total_states_queued = 0
     last_print_time = time.time()
@@ -117,7 +157,6 @@ def test_inference_server(conns, fast_infer, shared_counter, total_games, shared
     CHUNK_SIZE = 2 ** MAX_ORDER
     MIN_BATCH_SIZE = 64
 
-    print("🔥 Allocating Static Server Buffer in System RAM...", flush=True)
     MAX_POSSIBLE_BATCH = total_threads * MAX_CAPACITY
     SERVER_BUFFER = np.empty((MAX_POSSIBLE_BATCH, 20, 20, 8), dtype=np.float32)
     SERVER_BUFFER.fill(0.0)
@@ -138,7 +177,6 @@ def test_inference_server(conns, fast_infer, shared_counter, total_games, shared
                 if p in active_conns: active_conns.remove(p)
 
         if total_states_queued > 0:
-            
             t0 = time.time()
             actual_size = 0
             for w_id, size in zip(ready_indices, batch_sizes):
@@ -150,31 +188,28 @@ def test_inference_server(conns, fast_infer, shared_counter, total_games, shared
             
             t1 = time.time()
             v_preds, sc_preds = [], []
-            
             tensor_cursor = 0
-            rem = actual_size
             
-            while rem > 0:
-                curr_size = min(rem, CHUNK_SIZE)
-                
-                pad_target = 1 << (curr_size - 1).bit_length() if curr_size > 0 else 0
-                if pad_target < MIN_BATCH_SIZE: 
-                    pad_target = MIN_BATCH_SIZE
-                
-                chunk = batch_tensor[tensor_cursor : tensor_cursor + curr_size]
-                
-                if pad_target > curr_size:
-                    pad_array = np.zeros((pad_target - curr_size, 20, 20, 8), dtype=np.float32)
-                    chunk_padded = np.concatenate([chunk, pad_array], axis=0)
+            while tensor_cursor < actual_size:
+                curr_size = min(actual_size - tensor_cursor, CHUNK_SIZE)
+                if curr_size == CHUNK_SIZE:
+                    pred_v, pred_s = fast_infer(mx.array(batch_tensor[tensor_cursor : tensor_cursor + curr_size]))
                 else:
-                    chunk_padded = chunk
+                    pad_target = 1 << (curr_size - 1).bit_length() if curr_size > 0 else 0
+                    if pad_target < MIN_BATCH_SIZE: pad_target = MIN_BATCH_SIZE
                     
-                preds = fast_infer(chunk_padded)
-                v_preds.append(preds[0].numpy().flatten()[:curr_size])
-                sc_preds.append(preds[1].numpy().flatten()[:curr_size])
+                    chunk = batch_tensor[tensor_cursor : tensor_cursor + curr_size]
+                    if pad_target > curr_size:
+                        pad_array = np.zeros((pad_target - curr_size, 20, 20, 8), dtype=np.float32)
+                        chunk_padded = np.concatenate([chunk, pad_array], axis=0)
+                        pred_v, pred_s = fast_infer(mx.array(chunk_padded))
+                    else:
+                        pred_v, pred_s = fast_infer(mx.array(chunk))
                 
+                mx.eval(pred_v, pred_s)
+                v_preds.append(np.array(pred_v).flatten()[:curr_size])
+                sc_preds.append(np.array(pred_s).flatten()[:curr_size])
                 tensor_cursor += curr_size
-                rem -= curr_size
                 
             t_infer = (time.time() - t1) * 1000 
             t_per_sample = (t_infer / actual_size) if actual_size > 0 else 0.0
@@ -208,36 +243,30 @@ def test_inference_server(conns, fast_infer, shared_counter, total_games, shared
     print("\n✅ All test games completed!")
 
 def test_model(num_games=124):
-    import tensorflow as tf
+    model_path = "blokus_expert_latest.safetensors"
+    if not os.path.exists(model_path):
+        print(f"❌ Waiting for convert_keras_to_mlx.py to output a .safetensors model first.")
+        return
+
+    print(f"Warming up MLX Graph Compiler for {model_path}...")
+    model = MLXAdvancedBlokusModel()
+    model.load_weights(model_path)
+    model.eval()
     
-    tf.keras.mixed_precision.set_global_policy('mixed_float16')
-
-    keras_path = "blokus_expert_latest.keras"
-    if not os.path.exists(keras_path):
-        fallback = "blokus_expert_v18.keras"
-        if os.path.exists(fallback): keras_path = fallback
-        elif os.path.exists("blokus_expert_v0.keras"): keras_path = "blokus_expert_v0.keras"
-        else:
-            print(f"❌ Waiting for train_alphazero.py to output a model first.")
-            return
-
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus: tf.config.experimental.set_memory_growth(gpus[0], True)
-
-    print(f"Warming up TensorFlow Graph Compiler for {keras_path}...")
-    model = tf.keras.models.load_model(keras_path, compile=False)
-    
-    @tf.function(reduce_retracing=True, jit_compile=True)
+    # 🍏 Model is captured from closure, not passed as argument
+    @mx.compile
     def fast_infer(batch_tensor): 
-        return model(batch_tensor, training=False)
+        return model(batch_tensor)
 
     print(f"🔥 Pre-compiling Power-of-2 XLA Buckets (64 to {2 ** MAX_ORDER}) into System RAM...")
     for p in range(6, MAX_ORDER + 1):
-        _ = fast_infer(tf.zeros((2 ** p, 20, 20, 8), dtype=tf.float32))
+        dummy = mx.zeros((2 ** p, 20, 20, 8), dtype=mx.float32)
+        v, s = fast_infer(dummy)
+        mx.eval(v, s)
     print("✅ All dynamic graphs successfully compiled and cached!")
 
     print("="*60)
-    print(f"DISTRIBUTED TENSORFLOW BENCHMARK (BLOKUS - {num_games} GAMES)")
+    print(f"DISTRIBUTED MLX BENCHMARK (BLOKUS - {num_games} GAMES)")
     print("="*60)
 
     start_time = time.time()
@@ -260,7 +289,6 @@ def test_model(num_games=124):
     for i in range(NUM_WORKERS):
         conns_for_worker = child_conns[i * NUM_THREADS : (i + 1) * NUM_THREADS]
         indices_for_worker = list(range(i * NUM_THREADS, (i + 1) * NUM_THREADS))
-        
         p = ctx.Process(target=distributed_test_worker, args=(games_per_thread, conns_for_worker, result_queue, indices_for_worker, shared_counter, shared_data_bases, TOTAL_THREADS))
         p.start()
         processes.append(p)

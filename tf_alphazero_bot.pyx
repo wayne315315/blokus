@@ -12,58 +12,12 @@ import concurrent.futures
 
 class AdvancedBlokusModel:
     def __init__(self, board_size=20, num_blocks=4, filters=16):
+        # TensorFlow removed. The model is passed externally now.
+        # Keeping this initialization for interface compatibility.
         self.board_size = board_size
         self.num_blocks = num_blocks
         self.filters = filters
-        self.model = self.build_unified_model()
-
-    def build_unified_model(self):
-        import tensorflow as tf
-        from tensorflow.keras import layers, models
-
-        inputs = layers.Input(shape=(self.board_size, self.board_size, 8))
-        x = layers.Conv2D(self.filters, 3, padding='same', use_bias=False)(inputs)
-        x = layers.BatchNormalization()(x)
-        x = layers.Activation('relu')(x)
-
-        for _ in range(self.num_blocks):
-            shortcut = x
-            x = layers.Conv2D(self.filters, 3, padding='same', use_bias=False)(x)
-            x = layers.BatchNormalization()(x)
-            x = layers.Activation('relu')(x)
-            x = layers.Conv2D(self.filters, 3, padding='same', use_bias=False)(x)
-            x = layers.BatchNormalization()(x)
-            
-            g = layers.GlobalAveragePooling2D()(x)
-            g = layers.Dense(self.filters, use_bias=False)(g)
-            g = layers.Reshape((1, 1, self.filters))(g)
-            x = layers.Add()([x, g]) 
-            
-            x = layers.Add()([shortcut, x])
-            x = layers.Activation('relu')(x)
-
-        v = layers.Conv2D(1, 1, padding='same', use_bias=False)(x)
-        v = layers.BatchNormalization()(v)
-        v = layers.Activation('relu')(v)
-        v = layers.Flatten()(v)
-        v = layers.Dense(256, activation='relu')(v)
-        value_out = layers.Dense(1, activation='tanh', name='value', dtype='float32')(v)
-
-        s = layers.Conv2D(1, 1, padding='same', use_bias=False)(x)
-        s = layers.BatchNormalization()(s)
-        s = layers.Activation('relu')(s)
-        s = layers.Flatten()(s)
-        s = layers.Dense(256, activation='relu')(s)
-        score_out = layers.Dense(1, name='score_lead', dtype='float32')(s)  
-
-        model = models.Model(inputs=inputs, outputs=[value_out, score_out])
-        
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-            loss={'value': 'mean_squared_error', 'score_lead': 'huber'},
-            loss_weights={'value': 1.0, 'score_lead': 0.05}
-        )
-        return model
+        self.model = None
 
 cdef class ExpertNode:
     cdef public double prior
@@ -106,8 +60,7 @@ cdef list get_valid_corners(int[:, :] board, int color, bint is_first):
         
     for r in range(20):
         for c in range(20):
-            if board[r, c] != 0:
-                continue
+            if board[r, c] != 0: continue
             
             is_adj_color = False
             if r > 0 and board[r-1, c] == color: is_adj_color = True
@@ -115,8 +68,7 @@ cdef list get_valid_corners(int[:, :] board, int color, bint is_first):
             elif c > 0 and board[r, c-1] == color: is_adj_color = True
             elif c < 19 and board[r, c+1] == color: is_adj_color = True
             
-            if is_adj_color:
-                continue 
+            if is_adj_color: continue 
                 
             if r > 0 and c > 0 and board[r-1, c-1] == color: corners.append((r, c))
             elif r > 0 and c < 19 and board[r-1, c+1] == color: corners.append((r, c))
@@ -237,7 +189,6 @@ cdef class ExpertBlokusBot:
         
         cdef np.ndarray curr_board_np = np.array(board_np, copy=True, dtype=np.int32)
         cdef int[:, :] curr_board_view = curr_board_np
-        
         cdef dict curr_inv = {k: list(v) for k, v in inventories.items()}
         cdef dict curr_first = dict(first_moves)
         cdef int curr_color = color
@@ -276,11 +227,8 @@ cdef class ExpertBlokusBot:
             
             shape_name = best_action[1]
             shifted_coords = best_action[5]
-            
             for r_c in shifted_coords:
-                r = r_c[0]
-                c = r_c[1]
-                curr_board_view[r, c] = curr_color
+                curr_board_view[r_c[0], r_c[1]] = curr_color
                 
             curr_inv[curr_color].remove(shape_name)
             curr_first[curr_color] = False
@@ -304,8 +252,7 @@ cdef class ExpertBlokusBot:
         for n_obj, step_color in zip(search_path, colors_in_path):
             n = <ExpertNode>n_obj
             with n.lock:
-                if n is not root:
-                    n.virtual_loss -= 3
+                if n is not root: n.virtual_loss -= 3
                 n.visit_count += 1
                 if (step_color % 2) == (curr_color % 2):
                     n.value_sum += v_leaf
@@ -349,7 +296,6 @@ cdef class ExpertBlokusBot:
         cdef int next_color = (color % 4) + 1
         cdef np.ndarray next_board_np
         cdef int[:, :] next_board_view
-        cdef int r, c
         cdef tuple action, shifted_coords
         cdef str shape_name
         cdef dict next_inv, next_first
@@ -357,14 +303,11 @@ cdef class ExpertBlokusBot:
         for action in legal_moves:
             shape_name = action[1]
             shifted_coords = action[5]
-            
             next_board_np = np.array(board_view, copy=True, dtype=np.int32)
             next_board_view = next_board_np
             
             for r_c in shifted_coords:
-                r = r_c[0]
-                c = r_c[1]
-                next_board_view[r, c] = color
+                next_board_view[r_c[0], r_c[1]] = color
                 
             next_inv = {k: list(v) for k, v in inventories.items()}
             next_inv[color].remove(shape_name)
@@ -374,21 +317,29 @@ cdef class ExpertBlokusBot:
             after_states.append(self.c_build_state_tensor(next_board_view, next_color, next_first))
             
         cdef int batch_size = len(after_states)
-        cdef np.ndarray values
-        cdef int i
+        cdef np.ndarray values = np.zeros(batch_size, dtype=np.float32)
+        cdef int i, chunk_start, chunk_end, chunk_size
+        cdef int max_cap = 256  # 🚀 Pipe Chunk Limit
         
         if self.shared_data is not None:
             w_id, s_states, s_values, s_scores = self.shared_data
             with self.pipe_lock:
-                s_states[w_id, :batch_size] = after_states
-                self.pipe.send(batch_size)
-                self.pipe.recv()
-                values = s_values[w_id, :batch_size].copy()
+                for chunk_start in range(0, batch_size, max_cap):
+                    chunk_end = chunk_start + max_cap
+                    if chunk_end > batch_size: chunk_end = batch_size
+                    chunk_size = chunk_end - chunk_start
+                    
+                    s_states[w_id, :chunk_size] = after_states[chunk_start:chunk_end]
+                    self.pipe.send(chunk_size)
+                    self.pipe.recv()
+                    values[chunk_start:chunk_end] = s_values[w_id, :chunk_size].copy()
         else:
             with self.pipe_lock:
-                import tensorflow as tf
-                preds = self.model.predict(np.array(after_states), verbose=0)
-                values = preds[0].flatten()
+                # 🚀 Direct MLX call for single-threaded testing
+                import mlx.core as mx
+                v, s = self.model(mx.array(after_states))
+                mx.eval(v)
+                values = np.array(v).flatten()
 
         cdef bint is_enemy = (color % 2) != (next_color % 2)
         cdef np.ndarray q_values = np.zeros(batch_size, dtype=np.float64)
@@ -396,8 +347,7 @@ cdef class ExpertBlokusBot:
         
         for i in range(batch_size):
             q_values[i] = -values[i] if is_enemy else values[i]
-            if q_values[i] > max_q:
-                max_q = q_values[i]
+            if q_values[i] > max_q: max_q = q_values[i]
                 
         cdef double temperature = 0.25 if self.is_training else 0.1
         cdef np.ndarray exp_q = np.exp((q_values - max_q) / temperature)
@@ -420,8 +370,7 @@ cdef class ExpertBlokusBot:
         for r in range(20):
             for c in range(20):
                 p = board_view[r, c]
-                if p > 0:
-                    tensor_view[r, c, p-1] = 1.0
+                if p > 0: tensor_view[r, c, p-1] = 1.0
                 tensor_view[r, c, 4] = color_val
                 tensor_view[r, c, 5] = first_val
                 
@@ -436,8 +385,7 @@ cdef class ExpertBlokusBot:
         cdef set seen_moves = set()
         cdef list valid_corners = get_valid_corners(board_view, color, is_first)
         
-        if not valid_corners:
-            return []
+        if not valid_corners: return []
             
         for shape_name in my_shapes:
             shape_idx = self.shape_to_id[shape_name]
