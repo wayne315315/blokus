@@ -1,23 +1,29 @@
 import os
+import sys
 import time
 import glob
 import multiprocessing as mp
 import multiprocessing.connection
 import ctypes
 import numpy as np
+import threading
 import concurrent.futures
+from collections import deque
+import pickle 
+
+# 🚀 OS MEMORY FIX: Force thread stacks to 256KB to prevent Thread Stack Fragmentation
+threading.stack_size(256 * 1024)
 
 from helper import BOARD_SIZE, SHAPES
 
-MAX_ORDER = 10
+# 🚀 TF GC FIX: Prevents TensorFlow from dynamically tracing thousands of graphs
+MAX_ORDER = 16
 _NUM_CPUS = mp.cpu_count()
 NUM_WORKERS = min(31, _NUM_CPUS - 1 if _NUM_CPUS > 1 else 1)
 
-# 🚀 FIX: Prevent 27 GiB RAM Explosion
 MAX_CAPACITY = 2048
 
-# 🚀 MULTITHREADING: 4 Concurrent Games per Worker Process
-NUM_THREADS = 4
+NUM_THREADS = 2
 TOTAL_THREADS = NUM_WORKERS * NUM_THREADS
 
 def generate_expert_game(bot):
@@ -85,7 +91,6 @@ def single_game_thread(games_per_thread, conn, thread_idx, shared_data_bases, to
         with shared_counter.get_lock(): shared_counter.value += 1
             
     conn.send("DONE")
-    # 🚀 FIX: Explicitly shut down internal MCTS executor to completely stop Thread Stack Memory Leaks
     if hasattr(bot, 'executor') and bot.executor is not None:
         bot.executor.shutdown(wait=False)
     return S, V, SC, thread_total_turns
@@ -93,11 +98,11 @@ def single_game_thread(games_per_thread, conn, thread_idx, shared_data_bases, to
 def distributed_train_worker(games_per_thread, conns, result_queue, thread_indices, shared_counter, shared_data_bases, total_threads):
     os.environ['CUDA_VISIBLE_DEVICES'] = '-1' 
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
+    threading.stack_size(256 * 1024)
     
     S, V, SC = [], [], []
     worker_total_turns = 0
     
-    # Run 4 Game Threads parallelly
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(conns)) as executor:
         futures = []
         for conn, tid in zip(conns, thread_indices):
@@ -215,11 +220,14 @@ def training_inference_server(conns, fast_infer, shared_counter, total_games, sh
             
     print("\n✅ All GPU processes finished gathering data.", flush=True)
 
-def run_training_pipeline(num_iteration=50):
+def run_training_pipeline(num_iteration=1000):
     import tensorflow as tf
     from tf_alphazero_bot import AdvancedBlokusModel
 
-    tf.keras.mixed_precision.set_global_policy('mixed_float16')
+    # Apple Silicon struggles with mixed precision, so we selectively disable it.
+    is_mac = sys.platform == "darwin"
+    if not is_mac:
+        tf.keras.mixed_precision.set_global_policy('mixed_float16')
 
     gpus = tf.config.list_physical_devices('GPU')
     if gpus: tf.config.experimental.set_memory_growth(gpus[0], True)
@@ -227,15 +235,15 @@ def run_training_pipeline(num_iteration=50):
     model_path = "blokus_expert_latest.keras"
     if os.path.exists(model_path):
         print(f"🚀 Found existing model! Resuming training from {model_path}...", flush=True)
-        model = tf.keras.models.load_model(model_path, compile=False)
-        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4), loss={'value': 'mean_squared_error', 'score_lead': 'huber'}, loss_weights={'value': 1.0, 'score_lead': 0.05}, jit_compile=False)
+        # 🚀 FIX 1: load with compile=True to preserve the Adam Optimizer's internal momentum state!
+        model = tf.keras.models.load_model(model_path, compile=True)
     else:
         print("🚀 No existing model found. Building a new AdvancedBlokusModel from scratch...", flush=True)
         adv_model = AdvancedBlokusModel()
         model = adv_model.model
-        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4), loss={'value': 'mean_squared_error', 'score_lead': 'huber'}, loss_weights={'value': 1.0, 'score_lead': 0.05}, jit_compile=False)
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=2e-4), loss={'value': 'mean_squared_error', 'score_lead': 'huber'}, loss_weights={'value': 1.0, 'score_lead': 0.05})
 
-    @tf.function(reduce_retracing=True, jit_compile=True)
+    @tf.function(reduce_retracing=True, jit_compile=not is_mac)
     def fast_infer(batch_tensor): 
         return model(batch_tensor, training=False)
 
@@ -248,7 +256,29 @@ def run_training_pipeline(num_iteration=50):
     games_per_thread = max(1, TOTAL_GAMES_PER_ITERATION // TOTAL_THREADS)
     actual_total_games = TOTAL_THREADS * games_per_thread
 
-    # 🚀 FIX: Move 2.5 GB allocations outside the loop to prevent Iteration Leaks
+    # 🚀 REPLAY BUFFER INITIALIZATION
+    REPLAY_BUFFER_SIZE = 200000
+    start_iteration = 1
+    
+    # 🚀 FIX 2: CHECK IF HISTORICAL BUFFER EXISTS ON DISK
+    buffer_path = "replay_buffer.pkl"
+    if os.path.exists(buffer_path):
+        print(f"💾 Found existing Replay Buffer! Loading historical states from {buffer_path}...", flush=True)
+        with open(buffer_path, "rb") as f:
+            data = pickle.load(f)
+            # Safely unpack in case we are loading from an older buffer version
+            if len(data) == 4:
+                replay_states, replay_values, replay_scores, start_iteration = data
+            else:
+                replay_states, replay_values, replay_scores = data
+                start_iteration = 1
+        print(f"✅ Successfully loaded {len(replay_states)} historical states. Resuming at Iteration {start_iteration}.", flush=True)
+    else:
+        print(f"💾 No existing Replay Buffer found. Initializing empty queues.", flush=True)
+        replay_states = deque(maxlen=REPLAY_BUFFER_SIZE)
+        replay_values = deque(maxlen=REPLAY_BUFFER_SIZE)
+        replay_scores = deque(maxlen=REPLAY_BUFFER_SIZE)
+
     print("🔥 Allocating Static Inter-Process Communication Arrays (Once)...", flush=True)
     ctx = mp.get_context('spawn')
     shared_counter = ctx.Value('i', 0)
@@ -261,9 +291,15 @@ def run_training_pipeline(num_iteration=50):
     pipes = [ctx.Pipe() for _ in range(TOTAL_THREADS)]
     parent_conns, child_conns = [p[0] for p in pipes], [p[1] for p in pipes]
 
-    for iteration in range(1, num_iteration + 1):
+    for iteration in range(start_iteration, start_iteration + num_iteration):
+        
+        # 🚀 FIX 3: LEARNING RATE EXPONENTIAL SCHEDULING
+        # Drops from 2e-4 by ~5% every iteration, with a hard floor at 1e-5
+        current_lr = max(2e-4 * (0.95 ** (iteration - 1)), 1e-5)
+        model.optimizer.learning_rate.assign(current_lr)
+
         print(f"\n" + "="*70, flush=True)
-        print(f"🚀 STARTING Q-LEARNING ITERATION {iteration} | Generating {actual_total_games} Games", flush=True)
+        print(f"🚀 STARTING Q-LEARNING ITERATION {iteration} | LR: {current_lr:.2e} | Generating {actual_total_games} Games", flush=True)
         print("="*70, flush=True)
         
         start_time = time.time()
@@ -295,19 +331,39 @@ def run_training_pipeline(num_iteration=50):
         generation_time = time.time() - start_time
         avg_game_length = iteration_total_turns / actual_total_games
         
-        print(f"\n✅ Data Gen Complete in {generation_time:.1f}s | Saved States: {len(S)} | EXACT Avg Turns/Game: {avg_game_length:.1f}", flush=True)
-        print(f"🧠 Constructing tf.data.Dataset Pipeline...", flush=True)
-
-        dataset = tf.data.Dataset.from_tensor_slices((np.array(S, dtype=np.float32), {'value': np.array(V, dtype=np.float32), 'score_lead': np.array(SC, dtype=np.float32)}))
-        dataset = dataset.shuffle(buffer_size=min(15000, len(S)), reshuffle_each_iteration=True).batch(64).prefetch(tf.data.AUTOTUNE)
+        print(f"\n✅ Data Gen Complete in {generation_time:.1f}s | Extracted {len(S)} New States | EXACT Avg Turns/Game: {avg_game_length:.1f}", flush=True)
+        
+        # POPULATE THE REPLAY BUFFER
+        replay_states.extend(S)
+        replay_values.extend(V)
+        replay_scores.extend(SC)
+        
+        current_buffer_size = len(replay_states)
+        print(f"🧠 Replay Buffer Size: {current_buffer_size} / {REPLAY_BUFFER_SIZE}. Constructing Pipeline...", flush=True)
+        # 🚀 FIX: Force the massive 2.5 GB EagerTensor to stay in System RAM (CPU)
+        # This prevents TensorFlow from attempting to copy the entire history to the GPU at once.
+        with tf.device('/CPU:0'):
+            dataset = tf.data.Dataset.from_tensor_slices((
+                np.array(replay_states, dtype=np.float32), 
+                {
+                    'value': np.array(replay_values, dtype=np.float32), 
+                    'score_lead': np.array(replay_scores, dtype=np.float32)
+                }
+            ))
+        
+        dataset = dataset.shuffle(buffer_size=min(50000, current_buffer_size), reshuffle_each_iteration=True).batch(64).prefetch(tf.data.AUTOTUNE)
 
         print(f"🧠 Training Q-Value Neural Network...", flush=True)
-        model.fit(dataset, epochs=8, verbose=1)
+        model.fit(dataset, epochs=4, verbose=1)
         
-        print(f"💾 Saving generation {iteration}...", flush=True)
+        print(f"💾 Saving generation {iteration} model and replay buffer...", flush=True)
         current_model_name = f"blokus_expert_v{iteration}.keras"
         model.save(current_model_name)
         model.save("blokus_expert_latest.keras") 
+
+        # 🚀 FIX 4: SAVE THE HISTORICAL BUFFER & NEXT ITERATION COUNT TO DISK
+        with open(buffer_path, "wb") as f:
+            pickle.dump((replay_states, replay_values, replay_scores, iteration + 1), f, protocol=pickle.HIGHEST_PROTOCOL)
 
         for old_file in glob.glob("blokus_expert_v*.keras"):
             if old_file != current_model_name:
