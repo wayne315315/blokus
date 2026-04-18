@@ -11,21 +11,102 @@ import concurrent.futures
 from collections import deque
 import pickle 
 
+# 🍏 Import PyTorch framework
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+
 # 🚀 OS MEMORY FIX: Force thread stacks to 256KB to prevent Thread Stack Fragmentation
 threading.stack_size(256 * 1024)
 
 from helper import BOARD_SIZE, SHAPES
 
-# 🚀 TF GC FIX: Prevents TensorFlow from dynamically tracing thousands of graphs
+# 🚀 GC FIX: Prevents dynamically tracing thousands of graphs
 MAX_ORDER = 16
 _NUM_CPUS = mp.cpu_count()
-NUM_WORKERS = min(31, _NUM_CPUS - 1 if _NUM_CPUS > 1 else 1)
+NUM_WORKERS = 32
 
 MAX_CAPACITY = 2048
 
-NUM_THREADS = 2
+NUM_THREADS = 32
 TOTAL_THREADS = NUM_WORKERS * NUM_THREADS
 
+# ==========================================
+# 1. PyTorch Neural Network Architecture
+# ==========================================
+class ResBlock(nn.Module):
+    def __init__(self, filters):
+        super().__init__()
+        self.conv1 = nn.Conv2d(filters, filters, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(filters)
+        self.conv2 = nn.Conv2d(filters, filters, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(filters)
+        self.dense_g = nn.Linear(filters, filters, bias=False)
+
+    def forward(self, x):
+        shortcut = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        
+        # Global Average Pooling: (B, C, H, W) -> (B, C)
+        g = out.mean(dim=(2, 3))
+        g = self.dense_g(g)
+        # Reshape to (B, C, 1, 1) for broadcasting addition
+        g = g.view(g.size(0), g.size(1), 1, 1)
+        
+        out = out + g
+        out = out + shortcut
+        return F.relu(out)
+
+class PyTorchAdvancedBlokusModel(nn.Module):
+    def __init__(self, board_size=20, num_blocks=4, filters=16):
+        super().__init__()
+        self.board_size = board_size
+        
+        self.conv_init = nn.Conv2d(8, filters, 3, padding=1, bias=False)
+        self.bn_init = nn.BatchNorm2d(filters)
+        
+        self.res_blocks = nn.ModuleList([ResBlock(filters) for _ in range(num_blocks)])
+        
+        # Value Head
+        self.conv_v = nn.Conv2d(filters, 1, 1, padding=0, bias=False)
+        self.bn_v = nn.BatchNorm2d(1)
+        self.dense_v1 = nn.Linear(board_size * board_size, 256)
+        self.dense_v2 = nn.Linear(256, 1)
+        
+        # Score Head
+        self.conv_s = nn.Conv2d(filters, 1, 1, padding=0, bias=False)
+        self.bn_s = nn.BatchNorm2d(1)
+        self.dense_s1 = nn.Linear(board_size * board_size, 256)
+        self.dense_s2 = nn.Linear(256, 1)
+
+    def forward(self, x):
+        # Cython passes NHWC (B, H, W, C). PyTorch expects NCHW (B, C, H, W).
+        x = x.permute(0, 3, 1, 2).contiguous()
+        
+        x = F.relu(self.bn_init(self.conv_init(x)))
+        for block in self.res_blocks:
+            x = block(x)
+            
+        # Value Head Forward
+        v = F.relu(self.bn_v(self.conv_v(x)))
+        v = v.view(v.size(0), -1) # Flatten
+        v = F.relu(self.dense_v1(v))
+        value_out = torch.tanh(self.dense_v2(v))
+        
+        # Score Head Forward
+        s = F.relu(self.bn_s(self.conv_s(x)))
+        s = s.view(s.size(0), -1) # Flatten
+        s = F.relu(self.dense_s1(s))
+        score_out = self.dense_s2(s)
+        
+        return value_out, score_out
+
+# ==========================================
+# 2. Game Generation & Workers
+# ==========================================
 def generate_expert_game(bot):
     states, players = [], []
     board = [[0 for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
@@ -73,6 +154,7 @@ def generate_expert_game(bot):
     return states, val_targets, score_targets, total_turns_played
 
 def single_game_thread(games_per_thread, conn, thread_idx, shared_data_bases, total_threads, shared_counter):
+    # This requires tf_alphazero_bot to handle its own fallback locally.
     from tf_alphazero_bot import ExpertBlokusBot
     
     shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((total_threads, MAX_CAPACITY, 20, 20, 8))
@@ -96,8 +178,7 @@ def single_game_thread(games_per_thread, conn, thread_idx, shared_data_bases, to
     return S, V, SC, thread_total_turns
 
 def distributed_train_worker(games_per_thread, conns, result_queue, thread_indices, shared_counter, shared_data_bases, total_threads):
-    os.environ['CUDA_VISIBLE_DEVICES'] = '-1' 
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
+    os.environ['CUDA_VISIBLE_DEVICES'] = '-1' # Hide GPUs from worker processes to avoid CUDA initialization errors
     threading.stack_size(256 * 1024)
     
     S, V, SC = [], [], []
@@ -115,7 +196,10 @@ def distributed_train_worker(games_per_thread, conns, result_queue, thread_indic
             
     result_queue.put((S, V, SC, worker_total_turns))
 
-def training_inference_server(conns, fast_infer, shared_counter, total_games, shared_data_bases, total_threads):
+# ==========================================
+# 3. Inference Server
+# ==========================================
+def training_inference_server(conns, model, device, shared_counter, total_games, shared_data_bases, total_threads):
     shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((total_threads, MAX_CAPACITY, 20, 20, 8))
     shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((total_threads, MAX_CAPACITY))
     shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((total_threads, MAX_CAPACITY))
@@ -134,6 +218,8 @@ def training_inference_server(conns, fast_infer, shared_counter, total_games, sh
     MAX_POSSIBLE_BATCH = total_threads * MAX_CAPACITY
     SERVER_BUFFER = np.empty((MAX_POSSIBLE_BATCH, 20, 20, 8), dtype=np.float32)
     SERVER_BUFFER.fill(0.0) 
+
+    is_cuda = device.type == 'cuda'
 
     while active_conns:
         readable = multiprocessing.connection.wait(active_conns, timeout=0.001)
@@ -182,9 +268,17 @@ def training_inference_server(conns, fast_infer, shared_counter, total_games, sh
                 else:
                     chunk_padded = chunk
                     
-                preds = fast_infer(chunk_padded)
-                v_preds.append(preds[0].numpy().flatten()[:curr_size])
-                sc_preds.append(preds[1].numpy().flatten()[:curr_size])
+                # PyTorch Inference
+                chunk_torch = torch.from_numpy(chunk_padded).to(device)
+                with torch.no_grad():
+                    if is_cuda:
+                        with torch.autocast(device_type='cuda', dtype=torch.float16):
+                            pred_v, pred_s = model(chunk_torch)
+                    else:
+                        pred_v, pred_s = model(chunk_torch)
+                        
+                v_preds.append(pred_v.cpu().numpy().flatten()[:curr_size])
+                sc_preds.append(pred_s.cpu().numpy().flatten()[:curr_size])
                 
                 tensor_cursor += curr_size
                 rem -= curr_size
@@ -220,36 +314,41 @@ def training_inference_server(conns, fast_infer, shared_counter, total_games, sh
             
     print("\n✅ All GPU processes finished gathering data.", flush=True)
 
+# ==========================================
+# 4. Main Training Pipeline
+# ==========================================
 def run_training_pipeline(num_iteration=1000):
-    import tensorflow as tf
-    from tf_alphazero_bot import AdvancedBlokusModel
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+    print(f"🔥 Using device: {device}", flush=True)
 
-    # Apple Silicon struggles with mixed precision, so we selectively disable it.
-    is_mac = sys.platform == "darwin"
-    if not is_mac:
-        tf.keras.mixed_precision.set_global_policy('mixed_float16')
+    model = PyTorchAdvancedBlokusModel().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=2e-4)
 
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus: tf.config.experimental.set_memory_growth(gpus[0], True)
-
-    model_path = "blokus_expert_latest.keras"
+    model_path = "blokus_expert_latest.pt"
     if os.path.exists(model_path):
         print(f"🚀 Found existing model! Resuming training from {model_path}...", flush=True)
-        # 🚀 FIX 1: load with compile=True to preserve the Adam Optimizer's internal momentum state!
-        model = tf.keras.models.load_model(model_path, compile=True)
+        checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        if 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     else:
-        print("🚀 No existing model found. Building a new AdvancedBlokusModel from scratch...", flush=True)
-        adv_model = AdvancedBlokusModel()
-        model = adv_model.model
-        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=2e-4), loss={'value': 'mean_squared_error', 'score_lead': 'huber'}, loss_weights={'value': 1.0, 'score_lead': 0.05})
+        print("🚀 No existing model found. Building a new PyTorch AdvancedBlokusModel from scratch...", flush=True)
 
-    @tf.function(reduce_retracing=True, jit_compile=not is_mac)
-    def fast_infer(batch_tensor): 
-        return model(batch_tensor, training=False)
+    # 🚀 Pre-compile logic (PyTorch 2.0+ torch.compile)
+    is_mac = sys.platform == "darwin"
+    if not is_mac and hasattr(torch, "compile"):
+        print(f"🔥 Wrapping model with torch.compile for optimal execution...", flush=True)
+        fast_infer_model = torch.compile(model, mode="default")
+    else:
+        fast_infer_model = model
 
-    print(f"🔥 Pre-compiling Power-of-2 XLA Buckets (64 to {2 ** MAX_ORDER}) into System RAM...", flush=True)
-    for o in range(6, MAX_ORDER + 1):
-        _ = fast_infer(tf.zeros((2 ** o, 20, 20, 8), dtype=tf.float32))
+    print(f"🔥 Pre-compiling Power-of-2 Buckets (64 to {2 ** MAX_ORDER}) into System RAM...", flush=True)
+    fast_infer_model.eval()
+    with torch.no_grad():
+        for o in range(6, MAX_ORDER + 1):
+            dummy = torch.zeros((2 ** o, 20, 20, 8), dtype=torch.float32, device=device)
+            _ = fast_infer_model(dummy)
     print("✅ All dynamic graphs successfully compiled and cached!", flush=True)
     
     TOTAL_GAMES_PER_ITERATION = 1024
@@ -266,7 +365,6 @@ def run_training_pipeline(num_iteration=1000):
         print(f"💾 Found existing Replay Buffer! Loading historical states from {buffer_path}...", flush=True)
         with open(buffer_path, "rb") as f:
             data = pickle.load(f)
-            # Safely unpack in case we are loading from an older buffer version
             if len(data) == 4:
                 replay_states, replay_values, replay_scores, start_iteration = data
             else:
@@ -283,20 +381,24 @@ def run_training_pipeline(num_iteration=1000):
     ctx = mp.get_context('spawn')
     shared_counter = ctx.Value('i', 0)
     
-    shared_states_base = mp.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY * 20 * 20 * 8)
-    shared_values_base = mp.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY)
-    shared_scores_base = mp.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY)
+    shared_states_base = ctx.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY * 20 * 20 * 8)
+    shared_values_base = ctx.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY)
+    shared_scores_base = ctx.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY)
     shared_data_bases = (shared_states_base, shared_values_base, shared_scores_base)
 
     pipes = [ctx.Pipe() for _ in range(TOTAL_THREADS)]
     parent_conns, child_conns = [p[0] for p in pipes], [p[1] for p in pipes]
 
+    mse_loss_fn = nn.MSELoss()
+    huber_loss_fn = nn.HuberLoss(delta=1.0)
+    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+
     for iteration in range(start_iteration, start_iteration + num_iteration):
         
         # 🚀 FIX 3: LEARNING RATE EXPONENTIAL SCHEDULING
-        # Drops from 2e-4 by ~5% every iteration, with a hard floor at 1e-5
         current_lr = max(2e-4 * (0.95 ** (iteration - 1)), 1e-5)
-        model.optimizer.learning_rate.assign(current_lr)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = current_lr
 
         print(f"\n" + "="*70, flush=True)
         print(f"🚀 STARTING Q-LEARNING ITERATION {iteration} | LR: {current_lr:.2e} | Generating {actual_total_games} Games", flush=True)
@@ -316,7 +418,8 @@ def run_training_pipeline(num_iteration=1000):
             p.start()
             processes.append(p)
 
-        training_inference_server(parent_conns, fast_infer, shared_counter, actual_total_games, shared_data_bases, TOTAL_THREADS)
+        fast_infer_model.eval()
+        training_inference_server(parent_conns, fast_infer_model, device, shared_counter, actual_total_games, shared_data_bases, TOTAL_THREADS)
 
         S, V, SC = [], [], []
         iteration_total_turns = 0
@@ -340,34 +443,72 @@ def run_training_pipeline(num_iteration=1000):
         
         current_buffer_size = len(replay_states)
         print(f"🧠 Replay Buffer Size: {current_buffer_size} / {REPLAY_BUFFER_SIZE}. Constructing Pipeline...", flush=True)
-        # 🚀 FIX: Force the massive 2.5 GB EagerTensor to stay in System RAM (CPU)
-        # This prevents TensorFlow from attempting to copy the entire history to the GPU at once.
-        with tf.device('/CPU:0'):
-            dataset = tf.data.Dataset.from_tensor_slices((
-                np.array(replay_states, dtype=np.float32), 
-                {
-                    'value': np.array(replay_values, dtype=np.float32), 
-                    'score_lead': np.array(replay_scores, dtype=np.float32)
-                }
-            ))
         
-        dataset = dataset.shuffle(buffer_size=min(50000, current_buffer_size), reshuffle_each_iteration=True).batch(64).prefetch(tf.data.AUTOTUNE)
+        # DataLoader handles memory efficiently in PyTorch
+        tensor_x = torch.from_numpy(np.array(replay_states, dtype=np.float32))
+        tensor_v = torch.from_numpy(np.array(replay_values, dtype=np.float32).reshape(-1, 1))
+        tensor_s = torch.from_numpy(np.array(replay_scores, dtype=np.float32).reshape(-1, 1))
+        
+        dataset = TensorDataset(tensor_x, tensor_v, tensor_s)
+        dataloader = DataLoader(dataset, batch_size=64, shuffle=True, pin_memory=(device.type == 'cuda'), num_workers=0)
 
         print(f"🧠 Training Q-Value Neural Network...", flush=True)
-        model.fit(dataset, epochs=4, verbose=1)
+        fast_infer_model.train()
+        
+        epochs = 4
+        for epoch in range(epochs):
+            epoch_loss = 0.0
+            num_batches = 0
+            
+            for batch_x, batch_yv, batch_ys in dataloader:
+                batch_x, batch_yv, batch_ys = batch_x.to(device), batch_yv.to(device), batch_ys.to(device)
+                
+                optimizer.zero_grad(set_to_none=True)
+                
+                if device.type == 'cuda':
+                    with torch.autocast(device_type='cuda', dtype=torch.float16):
+                        pred_v, pred_s = fast_infer_model(batch_x)
+                        loss_v = mse_loss_fn(pred_v, batch_yv)
+                        loss_s = huber_loss_fn(pred_s, batch_ys)
+                        loss = loss_v + 0.05 * loss_s
+                        
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    pred_v, pred_s = fast_infer_model(batch_x)
+                    loss_v = mse_loss_fn(pred_v, batch_yv)
+                    loss_s = huber_loss_fn(pred_s, batch_ys)
+                    loss = loss_v + 0.05 * loss_s
+                    loss.backward()
+                    optimizer.step()
+                    
+                epoch_loss += loss.item()
+                num_batches += 1
+                
+            print(f"   Epoch {epoch+1}/{epochs} | Avg Loss: {epoch_loss/num_batches:.4f}", flush=True)
         
         print(f"💾 Saving generation {iteration} model and replay buffer...", flush=True)
-        current_model_name = f"blokus_expert_v{iteration}.keras"
-        model.save(current_model_name)
-        model.save("blokus_expert_latest.keras") 
+        current_model_name = f"blokus_expert_v{iteration}.pt"
+        
+        checkpoint_data = {
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'iteration': iteration
+        }
+        
+        torch.save(checkpoint_data, current_model_name)
+        torch.save(checkpoint_data, "blokus_expert_latest.pt") 
 
         # 🚀 FIX 4: SAVE THE HISTORICAL BUFFER & NEXT ITERATION COUNT TO DISK
         with open(buffer_path, "wb") as f:
             pickle.dump((replay_states, replay_values, replay_scores, iteration + 1), f, protocol=pickle.HIGHEST_PROTOCOL)
 
-        for old_file in glob.glob("blokus_expert_v*.keras"):
-            if old_file != current_model_name:
-                try: os.remove(old_file); print(f"🗑️ Auto-deleted old model: {old_file}", flush=True)
+        for old_file in glob.glob("blokus_expert_v*.pt"):
+            if old_file != current_model_name and old_file != "blokus_expert_latest.pt":
+                try: 
+                    os.remove(old_file)
+                    print(f"🗑️ Auto-deleted old model: {old_file}", flush=True)
                 except OSError: pass
 
 if __name__ == "__main__":
