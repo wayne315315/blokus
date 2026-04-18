@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import multiprocessing as mp
 import multiprocessing.connection 
@@ -14,7 +15,7 @@ import torch.nn.functional as F
 from helper import BOARD_SIZE, SHAPES
 from player import BotPlayer  
 
-MAX_ORDER = 10
+MAX_ORDER = 11
 _NUM_CPUS = mp.cpu_count()
 NUM_WORKERS = 32
 MAX_CAPACITY = 2048

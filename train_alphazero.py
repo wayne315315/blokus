@@ -24,7 +24,7 @@ threading.stack_size(256 * 1024)
 from helper import BOARD_SIZE, SHAPES
 
 # 🚀 GC FIX: Prevents dynamically tracing thousands of graphs
-MAX_ORDER = 16
+MAX_ORDER = 11
 _NUM_CPUS = mp.cpu_count()
 NUM_WORKERS = 32
 
