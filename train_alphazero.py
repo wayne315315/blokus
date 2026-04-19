@@ -11,19 +11,11 @@ import concurrent.futures
 from collections import deque
 import pickle 
 
-# 🍏 Import PyTorch framework
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
-
 # 🚀 OS MEMORY FIX: Force thread stacks to 256KB to prevent Thread Stack Fragmentation
 threading.stack_size(256 * 1024)
 
 from helper import BOARD_SIZE, SHAPES
 
-# 🚀 GC FIX: Prevents dynamically tracing thousands of graphs
 MAX_ORDER = 11
 _NUM_CPUS = mp.cpu_count()
 NUM_WORKERS = 32
@@ -32,77 +24,6 @@ MAX_CAPACITY = 2048
 
 NUM_THREADS = 32
 TOTAL_THREADS = NUM_WORKERS * NUM_THREADS
-
-# ==========================================
-# 1. PyTorch Neural Network Architecture
-# ==========================================
-class ResBlock(nn.Module):
-    def __init__(self, filters):
-        super().__init__()
-        self.conv1 = nn.Conv2d(filters, filters, 3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(filters)
-        self.conv2 = nn.Conv2d(filters, filters, 3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(filters)
-        self.dense_g = nn.Linear(filters, filters, bias=False)
-
-    def forward(self, x):
-        shortcut = x
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        
-        # Global Average Pooling: (B, C, H, W) -> (B, C)
-        g = out.mean(dim=(2, 3))
-        g = self.dense_g(g)
-        # Reshape to (B, C, 1, 1) for broadcasting addition
-        g = g.view(g.size(0), g.size(1), 1, 1)
-        
-        out = out + g
-        out = out + shortcut
-        return F.relu(out)
-
-class PyTorchAdvancedBlokusModel(nn.Module):
-    def __init__(self, board_size=20, num_blocks=4, filters=16):
-        super().__init__()
-        self.board_size = board_size
-        
-        self.conv_init = nn.Conv2d(8, filters, 3, padding=1, bias=False)
-        self.bn_init = nn.BatchNorm2d(filters)
-        
-        self.res_blocks = nn.ModuleList([ResBlock(filters) for _ in range(num_blocks)])
-        
-        # Value Head
-        self.conv_v = nn.Conv2d(filters, 1, 1, padding=0, bias=False)
-        self.bn_v = nn.BatchNorm2d(1)
-        self.dense_v1 = nn.Linear(board_size * board_size, 256)
-        self.dense_v2 = nn.Linear(256, 1)
-        
-        # Score Head
-        self.conv_s = nn.Conv2d(filters, 1, 1, padding=0, bias=False)
-        self.bn_s = nn.BatchNorm2d(1)
-        self.dense_s1 = nn.Linear(board_size * board_size, 256)
-        self.dense_s2 = nn.Linear(256, 1)
-
-    def forward(self, x):
-        # Cython passes NHWC (B, H, W, C). PyTorch expects NCHW (B, C, H, W).
-        x = x.permute(0, 3, 1, 2).contiguous()
-        
-        x = F.relu(self.bn_init(self.conv_init(x)))
-        for block in self.res_blocks:
-            x = block(x)
-            
-        # Value Head Forward
-        v = F.relu(self.bn_v(self.conv_v(x)))
-        v = v.view(v.size(0), -1) # Flatten
-        v = F.relu(self.dense_v1(v))
-        value_out = torch.tanh(self.dense_v2(v))
-        
-        # Score Head Forward
-        s = F.relu(self.bn_s(self.conv_s(x)))
-        s = s.view(s.size(0), -1) # Flatten
-        s = F.relu(self.dense_s1(s))
-        score_out = self.dense_s2(s)
-        
-        return value_out, score_out
 
 # ==========================================
 # 2. Game Generation & Workers
@@ -154,12 +75,11 @@ def generate_expert_game(bot):
     return states, val_targets, score_targets, total_turns_played
 
 def single_game_thread(games_per_thread, conn, thread_idx, shared_data_bases, total_threads, shared_counter):
-    # This requires tf_alphazero_bot to handle its own fallback locally.
     from tf_alphazero_bot import ExpertBlokusBot
     
-    shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((total_threads, MAX_CAPACITY, 20, 20, 8))
-    shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((total_threads, MAX_CAPACITY))
-    shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((total_threads, MAX_CAPACITY))
+    shared_states = np.ctypeslib.as_array(shared_data_bases[0]).reshape((total_threads, MAX_CAPACITY, 20, 20, 8))
+    shared_values = np.ctypeslib.as_array(shared_data_bases[1]).reshape((total_threads, MAX_CAPACITY))
+    shared_scores = np.ctypeslib.as_array(shared_data_bases[2]).reshape((total_threads, MAX_CAPACITY))
     
     bot = ExpertBlokusBot(pipe=conn, shared_data=(thread_idx, shared_states, shared_values, shared_scores), is_training=True)
     
@@ -173,36 +93,48 @@ def single_game_thread(games_per_thread, conn, thread_idx, shared_data_bases, to
         with shared_counter.get_lock(): shared_counter.value += 1
             
     conn.send("DONE")
+    
+    # 🚀 FIX: wait=True forces OS to reap the 8 MCTS threads cleanly, stopping Thread-Leak RAM Bloat
     if hasattr(bot, 'executor') and bot.executor is not None:
-        bot.executor.shutdown(wait=False)
+        bot.executor.shutdown(wait=True)
     return S, V, SC, thread_total_turns
 
-def distributed_train_worker(games_per_thread, conns, result_queue, thread_indices, shared_counter, shared_data_bases, total_threads):
-    os.environ['CUDA_VISIBLE_DEVICES'] = '-1' # Hide GPUs from worker processes to avoid CUDA initialization errors
+def distributed_train_worker(conns, result_queue, thread_indices, shared_counter, shared_data_bases, total_threads, cmd_queue):
+    os.environ['CUDA_VISIBLE_DEVICES'] = '-1' 
+    import threading
+    import concurrent.futures
     threading.stack_size(256 * 1024)
     
-    S, V, SC = [], [], []
-    worker_total_turns = 0
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(conns)) as executor:
-        futures = []
-        for conn, tid in zip(conns, thread_indices):
-            futures.append(executor.submit(single_game_thread, games_per_thread, conn, tid, shared_data_bases, total_threads, shared_counter))
-        
-        for f in concurrent.futures.as_completed(futures):
-            s, v, sc, turns = f.result()
-            S.extend(s); V.extend(v); SC.extend(sc)
-            worker_total_turns += turns
+    while True:
+        cmd = cmd_queue.get()
+        if cmd == "STOP":
+            break
             
-    result_queue.put((S, V, SC, worker_total_turns))
+        games_per_thread = cmd
+        S, V, SC = [], [], []
+        worker_total_turns = 0
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(conns)) as executor:
+            futures = []
+            for conn, tid in zip(conns, thread_indices):
+                futures.append(executor.submit(single_game_thread, games_per_thread, conn, tid, shared_data_bases, total_threads, shared_counter))
+            
+            for f in concurrent.futures.as_completed(futures):
+                s, v, sc, turns = f.result()
+                S.extend(s); V.extend(v); SC.extend(sc)
+                worker_total_turns += turns
+                
+        result_queue.put((S, V, SC, worker_total_turns))
 
 # ==========================================
 # 3. Inference Server
 # ==========================================
 def training_inference_server(conns, model, device, shared_counter, total_games, shared_data_bases, total_threads):
-    shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((total_threads, MAX_CAPACITY, 20, 20, 8))
-    shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((total_threads, MAX_CAPACITY))
-    shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((total_threads, MAX_CAPACITY))
+    import torch 
+
+    shared_states = np.ctypeslib.as_array(shared_data_bases[0]).reshape((total_threads, MAX_CAPACITY, 20, 20, 8))
+    shared_values = np.ctypeslib.as_array(shared_data_bases[1]).reshape((total_threads, MAX_CAPACITY))
+    shared_scores = np.ctypeslib.as_array(shared_data_bases[2]).reshape((total_threads, MAX_CAPACITY))
 
     active_conns = list(conns)
     conn_to_id = {conns[i]: i for i in range(total_threads)}
@@ -214,10 +146,11 @@ def training_inference_server(conns, model, device, shared_counter, total_games,
     CHUNK_SIZE =  2 ** MAX_ORDER
     MIN_BATCH_SIZE = 64
 
-    print("🔥 Allocating Static Server Buffer in System RAM...", flush=True)
-    MAX_POSSIBLE_BATCH = total_threads * MAX_CAPACITY
-    SERVER_BUFFER = np.empty((MAX_POSSIBLE_BATCH, 20, 20, 8), dtype=np.float32)
-    SERVER_BUFFER.fill(0.0) 
+    # 🚀 FIX: Prevent dynamic array fragmentation. Cap buffer to maximum possible legal moves (256 * threads). 
+    # Shrinks buffer from 26.8 GB to just 3.3 GB.
+    MAX_SAFE_BATCH = total_threads * 256
+    print(f"🔥 Allocating Efficient Server Buffer ({MAX_SAFE_BATCH} states) in System RAM...", flush=True)
+    SERVER_BUFFER = np.empty((MAX_SAFE_BATCH, 20, 20, 8), dtype=np.float32)
 
     is_cuda = device.type == 'cuda'
 
@@ -237,14 +170,22 @@ def training_inference_server(conns, model, device, shared_counter, total_games,
                 if p in active_conns: active_conns.remove(p)
 
         if total_states_queued > 0:
-            
             t0 = time.time()
-            actual_size = 0
-            for w_id, size in zip(ready_indices, batch_sizes):
-                SERVER_BUFFER[actual_size : actual_size + size] = shared_states[w_id, :size]
-                actual_size += size
+            
+            total_incoming = sum(batch_sizes)
+            
+            # Use safe pre-allocated buffer to stop glibc fragmentation. Fallback only if moves exceed 256.
+            if total_incoming > MAX_SAFE_BATCH:
+                views = [shared_states[w_id, :size] for w_id, size in zip(ready_indices, batch_sizes)]
+                batch_tensor = np.concatenate(views, axis=0)
+            else:
+                actual_size = 0
+                for w_id, size in zip(ready_indices, batch_sizes):
+                    SERVER_BUFFER[actual_size : actual_size + size] = shared_states[w_id, :size]
+                    actual_size += size
+                batch_tensor = SERVER_BUFFER[:actual_size]
                 
-            batch_tensor = SERVER_BUFFER[:actual_size]
+            actual_size = batch_tensor.shape[0]
             t_copy = (time.time() - t0) * 1000 
             
             t1 = time.time()
@@ -268,7 +209,6 @@ def training_inference_server(conns, model, device, shared_counter, total_games,
                 else:
                     chunk_padded = chunk
                     
-                # PyTorch Inference
                 chunk_torch = torch.from_numpy(chunk_padded).to(device)
                 with torch.no_grad():
                     if is_cuda:
@@ -303,7 +243,7 @@ def training_inference_server(conns, model, device, shared_counter, total_games,
             if curr_time - last_print_time > 0.5:
                 games_completed = shared_counter.value
                 print(f"⚡ GPU BATCH {actual_size:<5} | "
-                      f"Copy: {t_copy:>5.1f}ms | "
+                      f"Concat: {t_copy:>5.1f}ms | "
                       f"Infer: {t_infer:>5.1f}ms ({t_per_sample:>4.4f}ms/st) | "
                       f"Write: {t_write:>5.1f}ms | "
                       f"Games: {games_completed}/{total_games}   ", end='\r', flush=True)
@@ -317,8 +257,89 @@ def training_inference_server(conns, model, device, shared_counter, total_games,
 # ==========================================
 # 4. Main Training Pipeline
 # ==========================================
-def run_training_pipeline(num_iteration=1000):
+def run_training_pipeline(num_iteration=2000):
+    ctx = mp.get_context('spawn')
     
+    print("🔥 Allocating Static Inter-Process Communication Arrays (Once)...", flush=True)
+    shared_counter = ctx.Value('i', 0)
+    
+    shared_states_base = ctx.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY * 20 * 20 * 8, lock=False)
+    shared_values_base = ctx.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY, lock=False)
+    shared_scores_base = ctx.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY, lock=False)
+    
+    shared_data_bases = (shared_states_base, shared_values_base, shared_scores_base)
+
+    pipes = [ctx.Pipe() for _ in range(TOTAL_THREADS)]
+    parent_conns, child_conns = [p[0] for p in pipes], [p[1] for p in pipes]
+    
+    cmd_queue = ctx.Queue()
+    result_queue = ctx.Queue()
+    processes = []
+    
+    print("🚀 STARTING WORKER PROCESSES (BEFORE PYTORCH INITIALIZATION)...", flush=True)
+    for i in range(NUM_WORKERS):
+        conns_for_worker = child_conns[i * NUM_THREADS : (i + 1) * NUM_THREADS]
+        indices_for_worker = list(range(i * NUM_THREADS, (i + 1) * NUM_THREADS))
+        p = ctx.Process(target=distributed_train_worker, args=(conns_for_worker, result_queue, indices_for_worker, shared_counter, shared_data_bases, TOTAL_THREADS, cmd_queue))
+        p.start()
+        processes.append(p)
+
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import torch.optim as optim
+    from torch.utils.data import TensorDataset, DataLoader
+
+    class ResBlock(nn.Module):
+        def __init__(self, filters):
+            super().__init__()
+            self.conv1 = nn.Conv2d(filters, filters, 3, padding=1, bias=False)
+            self.bn1 = nn.BatchNorm2d(filters)
+            self.conv2 = nn.Conv2d(filters, filters, 3, padding=1, bias=False)
+            self.bn2 = nn.BatchNorm2d(filters)
+            self.dense_g = nn.Linear(filters, filters, bias=False)
+
+        def forward(self, x):
+            shortcut = x
+            out = F.relu(self.bn1(self.conv1(x)))
+            out = self.bn2(self.conv2(out))
+            g = out.mean(dim=(2, 3))
+            g = self.dense_g(g)
+            g = g.view(g.size(0), g.size(1), 1, 1)
+            out = out + g
+            out = out + shortcut
+            return F.relu(out)
+
+    class PyTorchAdvancedBlokusModel(nn.Module):
+        def __init__(self, board_size=20, num_blocks=4, filters=16):
+            super().__init__()
+            self.board_size = board_size
+            self.conv_init = nn.Conv2d(8, filters, 3, padding=1, bias=False)
+            self.bn_init = nn.BatchNorm2d(filters)
+            self.res_blocks = nn.ModuleList([ResBlock(filters) for _ in range(num_blocks)])
+            self.conv_v = nn.Conv2d(filters, 1, 1, padding=0, bias=False)
+            self.bn_v = nn.BatchNorm2d(1)
+            self.dense_v1 = nn.Linear(board_size * board_size, 256)
+            self.dense_v2 = nn.Linear(256, 1)
+            self.conv_s = nn.Conv2d(filters, 1, 1, padding=0, bias=False)
+            self.bn_s = nn.BatchNorm2d(1)
+            self.dense_s1 = nn.Linear(board_size * board_size, 256)
+            self.dense_s2 = nn.Linear(256, 1)
+
+        def forward(self, x):
+            x = x.permute(0, 3, 1, 2).contiguous()
+            x = F.relu(self.bn_init(self.conv_init(x)))
+            for block in self.res_blocks: x = block(x)
+            v = F.relu(self.bn_v(self.conv_v(x)))
+            v = v.view(v.size(0), -1) 
+            v = F.relu(self.dense_v1(v))
+            value_out = torch.tanh(self.dense_v2(v))
+            s = F.relu(self.bn_s(self.conv_s(x)))
+            s = s.view(s.size(0), -1) 
+            s = F.relu(self.dense_s1(s))
+            score_out = self.dense_s2(s)
+            return value_out, score_out
+
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"🔥 Using device: {device}", flush=True)
 
@@ -335,11 +356,11 @@ def run_training_pipeline(num_iteration=1000):
     else:
         print("🚀 No existing model found. Building a new PyTorch AdvancedBlokusModel from scratch...", flush=True)
 
-    # 🚀 Pre-compile logic (PyTorch 2.0+ torch.compile)
     is_mac = sys.platform == "darwin"
     if not is_mac and hasattr(torch, "compile"):
+        # 🚀 FIX: dynamic=True stops PyTorch from caching 6 distinct kernels and saves 15GB RAM
         print(f"🔥 Wrapping model with torch.compile for optimal execution...", flush=True)
-        fast_infer_model = torch.compile(model, mode="default")
+        fast_infer_model = torch.compile(model, mode="default", dynamic=True)
     else:
         fast_infer_model = model
 
@@ -355,11 +376,9 @@ def run_training_pipeline(num_iteration=1000):
     games_per_thread = max(1, TOTAL_GAMES_PER_ITERATION // TOTAL_THREADS)
     actual_total_games = TOTAL_THREADS * games_per_thread
 
-    # 🚀 REPLAY BUFFER INITIALIZATION
     REPLAY_BUFFER_SIZE = 200000
     start_iteration = 1
     
-    # 🚀 FIX 2: CHECK IF HISTORICAL BUFFER EXISTS ON DISK
     buffer_path = "replay_buffer.pkl"
     if os.path.exists(buffer_path):
         print(f"💾 Found existing Replay Buffer! Loading historical states from {buffer_path}...", flush=True)
@@ -377,25 +396,12 @@ def run_training_pipeline(num_iteration=1000):
         replay_values = deque(maxlen=REPLAY_BUFFER_SIZE)
         replay_scores = deque(maxlen=REPLAY_BUFFER_SIZE)
 
-    print("🔥 Allocating Static Inter-Process Communication Arrays (Once)...", flush=True)
-    ctx = mp.get_context('spawn')
-    shared_counter = ctx.Value('i', 0)
-    
-    shared_states_base = ctx.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY * 20 * 20 * 8)
-    shared_values_base = ctx.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY)
-    shared_scores_base = ctx.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY)
-    shared_data_bases = (shared_states_base, shared_values_base, shared_scores_base)
-
-    pipes = [ctx.Pipe() for _ in range(TOTAL_THREADS)]
-    parent_conns, child_conns = [p[0] for p in pipes], [p[1] for p in pipes]
-
     mse_loss_fn = nn.MSELoss()
     huber_loss_fn = nn.HuberLoss(delta=1.0)
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
 
     for iteration in range(start_iteration, start_iteration + num_iteration):
         
-        # 🚀 FIX 3: LEARNING RATE EXPONENTIAL SCHEDULING
         current_lr = max(2e-4 * (0.95 ** (iteration - 1)), 1e-5)
         for param_group in optimizer.param_groups:
             param_group['lr'] = current_lr
@@ -407,16 +413,9 @@ def run_training_pipeline(num_iteration=1000):
         start_time = time.time()
         shared_counter.value = 0
         
-        result_queue = ctx.Queue()
-        processes = []
-        
-        for i in range(NUM_WORKERS):
-            conns_for_worker = child_conns[i * NUM_THREADS : (i + 1) * NUM_THREADS]
-            indices_for_worker = list(range(i * NUM_THREADS, (i + 1) * NUM_THREADS))
-            
-            p = ctx.Process(target=distributed_train_worker, args=(games_per_thread, conns_for_worker, result_queue, indices_for_worker, shared_counter, shared_data_bases, TOTAL_THREADS))
-            p.start()
-            processes.append(p)
+        # 🚀 SIGNAL WORKERS TO WAKE UP
+        for _ in range(NUM_WORKERS):
+            cmd_queue.put(games_per_thread)
 
         fast_infer_model.eval()
         training_inference_server(parent_conns, fast_infer_model, device, shared_counter, actual_total_games, shared_data_bases, TOTAL_THREADS)
@@ -428,15 +427,12 @@ def run_training_pipeline(num_iteration=1000):
             s, v, sc, turns = result_queue.get()
             S.extend(s); V.extend(v); SC.extend(sc)
             iteration_total_turns += turns
-
-        for p in processes: p.join()
         
         generation_time = time.time() - start_time
         avg_game_length = iteration_total_turns / actual_total_games
         
         print(f"\n✅ Data Gen Complete in {generation_time:.1f}s | Extracted {len(S)} New States | EXACT Avg Turns/Game: {avg_game_length:.1f}", flush=True)
         
-        # POPULATE THE REPLAY BUFFER
         replay_states.extend(S)
         replay_values.extend(V)
         replay_scores.extend(SC)
@@ -444,7 +440,6 @@ def run_training_pipeline(num_iteration=1000):
         current_buffer_size = len(replay_states)
         print(f"🧠 Replay Buffer Size: {current_buffer_size} / {REPLAY_BUFFER_SIZE}. Constructing Pipeline...", flush=True)
         
-        # DataLoader handles memory efficiently in PyTorch
         tensor_x = torch.from_numpy(np.array(replay_states, dtype=np.float32))
         tensor_v = torch.from_numpy(np.array(replay_values, dtype=np.float32).reshape(-1, 1))
         tensor_s = torch.from_numpy(np.array(replay_scores, dtype=np.float32).reshape(-1, 1))
@@ -500,7 +495,6 @@ def run_training_pipeline(num_iteration=1000):
         torch.save(checkpoint_data, current_model_name)
         torch.save(checkpoint_data, "blokus_expert_latest.pt") 
 
-        # 🚀 FIX 4: SAVE THE HISTORICAL BUFFER & NEXT ITERATION COUNT TO DISK
         with open(buffer_path, "wb") as f:
             pickle.dump((replay_states, replay_values, replay_scores, iteration + 1), f, protocol=pickle.HIGHEST_PROTOCOL)
 
@@ -510,6 +504,12 @@ def run_training_pipeline(num_iteration=1000):
                     os.remove(old_file)
                     print(f"🗑️ Auto-deleted old model: {old_file}", flush=True)
                 except OSError: pass
+
+    # Clean up persistent workers
+    for _ in range(NUM_WORKERS):
+        cmd_queue.put("STOP")
+    for p in processes:
+        p.join()
 
 if __name__ == "__main__":
     mp.freeze_support()

@@ -10,13 +10,7 @@ from libc.math cimport sqrt
 from helper import BOARD_SIZE, SHAPES, flip_shape, rotate_shape
 import concurrent.futures
 
-class AdvancedBlokusModel:
-    def __init__(self, board_size=20, num_blocks=4, filters=16):
-        # PyTorch model will be passed externally via Python scope
-        self.board_size = board_size
-        self.num_blocks = num_blocks
-        self.filters = filters
-        self.model = None
+# 🚀 DELETED GLOBAL PYTORCH IMPORTS HERE to prevent Cython from poisoning worker RAM
 
 cdef class ExpertNode:
     cdef public double prior
@@ -127,7 +121,7 @@ cdef class ExpertBlokusBot:
         self.is_training = is_training
         self.c_puct = 1.5
         self.pipe_lock = threading.Lock()
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
         self.shape_keys = list(SHAPES.keys())
         self.shape_to_id = {name: idx for idx, name in enumerate(self.shape_keys)}
@@ -186,6 +180,7 @@ cdef class ExpertBlokusBot:
         
         cdef np.ndarray curr_board_np = np.array(board_np, copy=True, dtype=np.int32)
         cdef int[:, :] curr_board_view = curr_board_np
+        
         cdef dict curr_inv = {k: list(v) for k, v in inventories.items()}
         cdef dict curr_first = dict(first_moves)
         cdef int curr_color = color
@@ -224,6 +219,7 @@ cdef class ExpertBlokusBot:
             
             shape_name = best_action[1]
             shifted_coords = best_action[5]
+            
             for r_c in shifted_coords:
                 curr_board_view[r_c[0], r_c[1]] = curr_color
                 
@@ -322,6 +318,7 @@ cdef class ExpertBlokusBot:
         cdef int i
         
         if self.shared_data is not None:
+            # WORKER PROCESSES EXCLUSIVELY HIT THIS BLOCK (NO PYTORCH USED)
             w_id, s_states, s_values, s_scores = self.shared_data
             with self.pipe_lock:
                 s_states[w_id, :batch_size] = after_states
@@ -329,24 +326,20 @@ cdef class ExpertBlokusBot:
                 self.pipe.recv()
                 values = s_values[w_id, :batch_size].copy()
         else:
+            # 🚀 LOCALIZED IMPORT: ONLY MAIN PROCESS LOADS PYTORCH IF DOING LOCAL INFERENCE
+            import torch
             with self.pipe_lock:
-                # 🚀 PYTORCH FALLBACK FOR LOCAL TESTING
-                import torch
-                
-                # Fetch device from the model
                 device = next(self.model.parameters()).device
-                
+                self.model.eval()
                 with torch.no_grad():
-                    # Load states and transfer to the appropriate hardware target
                     tensor_states = torch.tensor(np.array(after_states, dtype=np.float32), device=device)
-                    
                     if device.type == 'cuda':
                         with torch.autocast(device_type='cuda', dtype=torch.float16):
-                            preds_v, preds_s = self.model(tensor_states)
+                            v_out, _ = self.model(tensor_states)
                     else:
-                        preds_v, preds_s = self.model(tensor_states)
+                        v_out, _ = self.model(tensor_states)
                         
-                values = preds_v.cpu().numpy().flatten()
+                    values = v_out.cpu().numpy().flatten()
 
         cdef bint is_enemy = (color % 2) != (next_color % 2)
         cdef np.ndarray q_values = np.zeros(batch_size, dtype=np.float64)
