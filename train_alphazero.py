@@ -5,24 +5,26 @@ import glob
 import multiprocessing as mp
 import multiprocessing.connection
 import ctypes
+from xml.parsers.expat import model
 import numpy as np
 import threading
 import concurrent.futures
 from collections import deque
+from functools import partial
 import pickle 
 
 # 🍏 Import Apple MLX framework
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
+from mlx.utils import tree_flatten, tree_unflatten
 
 threading.stack_size(256 * 1024)
 
 from helper import BOARD_SIZE, SHAPES
 
 MAX_ORDER = 10
-_NUM_CPUS = mp.cpu_count()
-NUM_WORKERS = min(31, _NUM_CPUS - 1 if _NUM_CPUS > 1 else 1)
+NUM_WORKERS = mp.cpu_count()
 MAX_CAPACITY = 2048
 NUM_THREADS = 4
 TOTAL_THREADS = NUM_WORKERS * NUM_THREADS
@@ -41,8 +43,13 @@ class ResidualBlock(nn.Module):
 
     def __call__(self, x):
         shortcut = x
-        x = nn.relu(self.bn1(self.conv1(x)))
-        x = self.bn2(self.conv2(x))
+        # 🍏 Force cast back to float16 after the float32 BatchNorm
+        c1 = self.bn1(self.conv1(x)).astype(mx.float16)
+        x = nn.relu(c1)
+        
+        c2 = self.bn2(self.conv2(x)).astype(mx.float16)
+        x = c2
+        
         g = x.mean(axis=(1, 2))
         g = self.dense_g(g).reshape(g.shape[0], 1, 1, g.shape[1])
         x = x + g + shortcut
@@ -66,16 +73,21 @@ class MLXAdvancedBlokusModel(nn.Module):
         self.dense_s2 = nn.Linear(256, 1)
 
     def __call__(self, x):
-        x = nn.relu(self.bn_init(self.conv_init(x)))
+        # 🍏 Force cast back to float16 after the float32 BatchNorm
+        x = self.bn_init(self.conv_init(x)).astype(mx.float16)
+        x = nn.relu(x)
+        
         for block in self.res_blocks:
             x = block(x)
 
-        v = nn.relu(self.bn_v(self.conv_v(x)))
+        v = self.bn_v(self.conv_v(x)).astype(mx.float16)
+        v = nn.relu(v)
         v = v.reshape(v.shape[0], -1)
         v = nn.relu(self.dense_v1(v))
         value_out = mx.tanh(self.dense_v2(v))
 
-        s = nn.relu(self.bn_s(self.conv_s(x)))
+        s = self.bn_s(self.conv_s(x)).astype(mx.float16)
+        s = nn.relu(s)
         s = s.reshape(s.shape[0], -1)
         s = nn.relu(self.dense_s1(s))
         score_out = self.dense_s2(s)
@@ -149,9 +161,9 @@ def generate_expert_game(bot):
 
 def single_game_thread(games_per_thread, conn, thread_idx, shared_data_bases, total_threads, shared_counter):
     from tf_alphazero_bot import ExpertBlokusBot
-    shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((total_threads, MAX_CAPACITY, 20, 20, 8))
-    shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((total_threads, MAX_CAPACITY))
-    shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((total_threads, MAX_CAPACITY))
+    shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).view(np.float16).reshape((total_threads, MAX_CAPACITY, 20, 20, 8))
+    shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).view(np.float16).reshape((total_threads, MAX_CAPACITY))
+    shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).view(np.float16).reshape((total_threads, MAX_CAPACITY))
     
     bot = ExpertBlokusBot(pipe=conn, shared_data=(thread_idx, shared_states, shared_values, shared_scores), is_training=True)
     
@@ -184,10 +196,11 @@ def distributed_train_worker(games_per_thread, conns, result_queue, thread_indic
 # ==========================================
 # 4. Inference Server
 # ==========================================
+"""
 def training_inference_server(conns, fast_infer, shared_counter, total_games, shared_data_bases, total_threads):
-    shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).reshape((total_threads, MAX_CAPACITY, 20, 20, 8))
-    shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).reshape((total_threads, MAX_CAPACITY))
-    shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).reshape((total_threads, MAX_CAPACITY))
+    shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).view(np.float16).reshape((total_threads, MAX_CAPACITY, 20, 20, 8))
+    shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).view(np.float16).reshape((total_threads, MAX_CAPACITY))
+    shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).view(np.float16).reshape((total_threads, MAX_CAPACITY))
 
     active_conns = list(conns)
     conn_to_id = {conns[i]: i for i in range(total_threads)}
@@ -195,12 +208,115 @@ def training_inference_server(conns, fast_infer, shared_counter, total_games, sh
     total_states_queued = 0
     last_print_time = time.time()
     
-    CHUNK_SIZE =  2 ** MAX_ORDER
+    CHUNK_SIZE = 2 ** MAX_ORDER
     MIN_BATCH_SIZE = 64
 
-    MAX_POSSIBLE_BATCH = total_threads * MAX_CAPACITY
-    SERVER_BUFFER = np.empty((MAX_POSSIBLE_BATCH, 20, 20, 8), dtype=np.float32)
-    SERVER_BUFFER.fill(0.0) 
+    # 🚀 Pre-allocate a Numpy buffer
+    SERVER_BUFFER = np.empty((total_threads * MAX_CAPACITY, 20, 20, 8), dtype=np.float16)
+
+    while active_conns:
+        # Original timing constraint: Instant response
+        readable = multiprocessing.connection.wait(active_conns, timeout=0.001)
+        for p in readable:
+            try:
+                msg = p.recv()
+                if msg == "DONE":
+                    active_conns.remove(p)
+                else:
+                    ready_indices.append(conn_to_id[p])
+                    batch_sizes.append(msg) 
+                    ready_pipes.append(p)
+                    total_states_queued += msg
+            except EOFError:
+                if p in active_conns: active_conns.remove(p)
+
+        if total_states_queued > 0:
+            t0 = time.time()
+            
+            actual_size = 0
+            for w_id, size in zip(ready_indices, batch_sizes):
+                SERVER_BUFFER[actual_size : actual_size + size] = shared_states[w_id, :size]
+                actual_size += size
+                
+            t_copy = (time.time() - t0) * 1000 
+            
+            t1 = time.time()
+            tensor_cursor = 0
+            
+            # Pre-allocate numpy arrays to hold the final sliced results
+            v_numpy = np.empty(actual_size, dtype=np.float16)
+            sc_numpy = np.empty(actual_size, dtype=np.float16)
+            
+            while tensor_cursor < actual_size:
+                curr_size = min(actual_size - tensor_cursor, CHUNK_SIZE)
+                
+                # Calculate strict static pad target
+                pad_target = 1 << (curr_size - 1).bit_length() if curr_size > 0 else 0
+                if pad_target < MIN_BATCH_SIZE: pad_target = MIN_BATCH_SIZE
+                
+                # 🍏 Pure Numpy Padding (Bypasses MLX graph completely)
+                if pad_target > curr_size:
+                    SERVER_BUFFER[tensor_cursor + curr_size : tensor_cursor + pad_target].fill(0.0)
+                
+                # Feed the EXACT static shape into MLX
+                chunk_input = mx.array(SERVER_BUFFER[tensor_cursor : tensor_cursor + pad_target])
+                
+                # 🍏 Infer and eval immediately. The graph is perfectly static.
+                pred_v, pred_s = fast_infer(chunk_input)
+                mx.eval(pred_v, pred_s)
+                
+                # 🍏 Slice in Numpy AFTER evaluation. No MLX graph mutation!
+                v_numpy[tensor_cursor : tensor_cursor + curr_size] = np.array(pred_v)[:curr_size].flatten()
+                sc_numpy[tensor_cursor : tensor_cursor + curr_size] = np.array(pred_s)[:curr_size].flatten()
+                
+                tensor_cursor += curr_size
+            
+            t_infer = (time.time() - t1) * 1000 
+            t_per_sample = (t_infer / actual_size) if actual_size > 0 else 0.0
+            
+            t2 = time.time()
+            cursor = 0
+            for w_id, size in zip(ready_indices, batch_sizes):
+                shared_values[w_id, :size] = v_numpy[cursor:cursor+size]
+                shared_scores[w_id, :size] = sc_numpy[cursor:cursor+size]
+                cursor += size
+            t_write = (time.time() - t2) * 1000
+
+            for pipe in ready_pipes: pipe.send(True)
+
+            curr_time = time.time()
+            if curr_time - last_print_time > 0.5:
+                print(f"⚡ GPU BATCH {actual_size:<5} | "
+                      f"Copy/Setup: {t_copy:>5.1f}ms | "
+                      f"Infer: {t_infer:>5.1f}ms ({t_per_sample:>4.4f}ms/st) | "
+                      f"Write: {t_write:>5.1f}ms | "
+                      f"Games: {shared_counter.value}/{total_games}   ", end='\r', flush=True)
+                last_print_time = curr_time
+
+            ready_indices, batch_sizes, ready_pipes = [], [], []
+            total_states_queued = 0
+            
+    print("\n✅ All GPU processes finished gathering data.", flush=True)
+"""
+# ==========================================
+# 4. Inference Server
+# ==========================================
+def training_inference_server(conns, fast_infer, shared_counter, total_games, shared_data_bases, total_threads):
+    shared_states = np.ctypeslib.as_array(shared_data_bases[0].get_obj()).view(np.float16).reshape((total_threads, MAX_CAPACITY, 20, 20, 8))
+    shared_values = np.ctypeslib.as_array(shared_data_bases[1].get_obj()).view(np.float16).reshape((total_threads, MAX_CAPACITY))
+    shared_scores = np.ctypeslib.as_array(shared_data_bases[2].get_obj()).view(np.float16).reshape((total_threads, MAX_CAPACITY))
+
+    active_conns = list(conns)
+    conn_to_id = {conns[i]: i for i in range(total_threads)}
+    ready_indices, batch_sizes, ready_pipes = [], [], []
+    total_states_queued = 0
+    last_print_time = time.time()
+    
+    CHUNK_SIZE = 2 ** MAX_ORDER
+    MIN_BATCH_SIZE = 64
+
+    # 🚀 Pre-allocate a Numpy buffer
+    SERVER_BUFFER = np.empty((total_threads * MAX_CAPACITY, 20, 20, 8), dtype=np.float16)
 
     while active_conns:
         readable = multiprocessing.connection.wait(active_conns, timeout=0.001)
@@ -219,46 +335,59 @@ def training_inference_server(conns, fast_infer, shared_counter, total_games, sh
 
         if total_states_queued > 0:
             t0 = time.time()
+            
             actual_size = 0
             for w_id, size in zip(ready_indices, batch_sizes):
                 SERVER_BUFFER[actual_size : actual_size + size] = shared_states[w_id, :size]
                 actual_size += size
                 
-            batch_tensor = SERVER_BUFFER[:actual_size]
             t_copy = (time.time() - t0) * 1000 
             
             t1 = time.time()
-            v_numpy = np.empty(actual_size, dtype=np.float32)
-            sc_numpy = np.empty(actual_size, dtype=np.float32)
             tensor_cursor = 0
+            
+            # Pre-allocate numpy arrays to hold the final sliced results
+            v_numpy = np.empty(actual_size, dtype=np.float16)
+            sc_numpy = np.empty(actual_size, dtype=np.float16)
+            
+            pending_evals_v = []
+            pending_evals_s = []
+            chunk_sizes = []
             
             while tensor_cursor < actual_size:
                 curr_size = min(actual_size - tensor_cursor, CHUNK_SIZE)
                 
-                # 🍏 16-BIT PRECISION INJECTION
-                if curr_size == CHUNK_SIZE:
-                    chunk_input = mx.array(batch_tensor[tensor_cursor : tensor_cursor + curr_size], dtype=mx.float16)
-                    pred_v, pred_s = fast_infer(chunk_input)
-                else:
-                    pad_target = 1 << (curr_size - 1).bit_length() if curr_size > 0 else 0
-                    if pad_target < MIN_BATCH_SIZE: pad_target = MIN_BATCH_SIZE
-                    
-                    chunk = batch_tensor[tensor_cursor : tensor_cursor + curr_size]
-                    if pad_target > curr_size:
-                        pad_array = np.zeros((pad_target - curr_size, 20, 20, 8), dtype=np.float32)
-                        chunk_padded = np.concatenate([chunk, pad_array], axis=0)
-                        chunk_input = mx.array(chunk_padded, dtype=mx.float16)
-                        pred_v, pred_s = fast_infer(chunk_input)
-                    else:
-                        chunk_input = mx.array(chunk, dtype=mx.float16)
-                        pred_v, pred_s = fast_infer(chunk_input)
+                # Calculate strict static pad target
+                pad_target = 1 << (curr_size - 1).bit_length() if curr_size > 0 else 0
+                if pad_target < MIN_BATCH_SIZE: pad_target = MIN_BATCH_SIZE
                 
-                mx.eval(pred_v, pred_s)
-                # Results come back as float16 numpy arrays, which implicitly upcast back to our float32 buffer
-                v_numpy[tensor_cursor : tensor_cursor + curr_size] = np.array(pred_v).flatten()[:curr_size]
-                sc_numpy[tensor_cursor : tensor_cursor + curr_size] = np.array(pred_s).flatten()[:curr_size]
+                # 🍏 Pure Numpy Padding
+                if pad_target > curr_size:
+                    SERVER_BUFFER[tensor_cursor + curr_size : tensor_cursor + pad_target].fill(0.0)
+                
+                # Feed the EXACT static shape into MLX
+                chunk_input = mx.array(SERVER_BUFFER[tensor_cursor : tensor_cursor + pad_target])
+                pred_v, pred_s = fast_infer(chunk_input)
+                
+                # 🍏 DONT EVAL YET! Queue the un-evaluated graphs so the GPU can pipeline them.
+                pending_evals_v.append(pred_v)
+                pending_evals_s.append(pred_s)
+                chunk_sizes.append(curr_size)
+                
                 tensor_cursor += curr_size
                 
+            # 🍏 Evaluate ALL chunks simultaneously on the GPU! 
+            # This stops the CPU and GPU from blocking each other on massive batches.
+            mx.eval(*pending_evals_v, *pending_evals_s)
+            
+            # 🍏 Pull to CPU sequentially only AFTER all GPU math is completely finished
+            cursor = 0
+            for i in range(len(chunk_sizes)):
+                c_size = chunk_sizes[i]
+                v_numpy[cursor : cursor + c_size] = np.array(pending_evals_v[i])[:c_size].flatten()
+                sc_numpy[cursor : cursor + c_size] = np.array(pending_evals_s[i])[:c_size].flatten()
+                cursor += c_size
+            
             t_infer = (time.time() - t1) * 1000 
             t_per_sample = (t_infer / actual_size) if actual_size > 0 else 0.0
             
@@ -275,7 +404,7 @@ def training_inference_server(conns, fast_infer, shared_counter, total_games, sh
             curr_time = time.time()
             if curr_time - last_print_time > 0.5:
                 print(f"⚡ GPU BATCH {actual_size:<5} | "
-                      f"Copy: {t_copy:>5.1f}ms | "
+                      f"Copy/Setup: {t_copy:>5.1f}ms | "
                       f"Infer: {t_infer:>5.1f}ms ({t_per_sample:>4.4f}ms/st) | "
                       f"Write: {t_write:>5.1f}ms | "
                       f"Games: {shared_counter.value}/{total_games}   ", end='\r', flush=True)
@@ -299,36 +428,46 @@ def run_training_pipeline(num_iteration=1000):
         print(f"🚀 Found existing model! Resuming training from {weights_path}...", flush=True)
         model.load_weights(weights_path)
     
-    # 🍏 FORCE FLOAT16 PRECISION
-    # We cast after loading to ensure all weights reside in memory as 16-bit floats
+    # 🍏 FORCE FLOAT16 PRECISION (while keeping BN float32)
     model.set_dtype(mx.float16)
+    model.bn_init.set_dtype(mx.float32)
+    model.bn_v.set_dtype(mx.float32)
+    model.bn_s.set_dtype(mx.float32)
+    for block in model.res_blocks:
+        block.bn1.set_dtype(mx.float32)
+        block.bn2.set_dtype(mx.float32)
 
-    optimizer = optim.Adam(learning_rate=2e-4)
+    optimizer = optim.SGD(learning_rate=2e-4, momentum=0.9)
     if os.path.exists(optim_path):
-        optimizer.load_state(optim_path)
+        print(f"🚀 Restoring Optimizer state from {optim_path}...", flush=True)
+        loaded_flat_state = mx.load(optim_path)
+        optimizer.state = tree_unflatten(list(loaded_flat_state.items()))
+    else:
+        print("⚙️ Explicitly allocating optimizer state...\n", flush=True)
+        optimizer.init(model.trainable_parameters())
 
-    # 🍏 Compile closures correctly
     loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
-    
-    @mx.compile
+    state = [model.state, optimizer.state]
+
+    @partial(mx.compile, inputs=state, outputs=state)
     def train_step(x, y_val, y_score):
         loss, grads = loss_and_grad_fn(model, x, y_val, y_score)
         optimizer.update(model, grads)
         return loss
 
-    @mx.compile
+    @partial(mx.compile, inputs=model.state)
     def fast_infer(batch_tensor): 
         return model(batch_tensor)
-
+    
+    model.eval()
     print(f"🔥 Pre-compiling MLX Power-of-2 Buckets (64 to {2 ** MAX_ORDER}) into System RAM...", flush=True)
     for o in range(6, MAX_ORDER + 1):
-        # 🍏 Dummy tensor must match the float16 precision
         dummy = mx.zeros((2 ** o, 20, 20, 8), dtype=mx.float16)
         v, s = fast_infer(dummy)
         mx.eval(v, s)
     print("✅ All dynamic graphs successfully compiled via @mx.compile!", flush=True)
     
-    TOTAL_GAMES_PER_ITERATION = 1024
+    TOTAL_GAMES_PER_ITERATION = 40
     games_per_thread = max(1, TOTAL_GAMES_PER_ITERATION // TOTAL_THREADS)
     actual_total_games = TOTAL_THREADS * games_per_thread
 
@@ -354,9 +493,10 @@ def run_training_pipeline(num_iteration=1000):
     ctx = mp.get_context('spawn')
     shared_counter = ctx.Value('i', 0)
     
-    shared_states_base = mp.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY * 20 * 20 * 8)
-    shared_values_base = mp.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY)
-    shared_scores_base = mp.Array(ctypes.c_float, TOTAL_THREADS * MAX_CAPACITY)
+    # Use ctypes.c_int16 to simulate true float16 shared memory without CPU casting
+    shared_states_base = ctx.Array(ctypes.c_int16, TOTAL_THREADS * MAX_CAPACITY * 20 * 20 * 8)
+    shared_values_base = ctx.Array(ctypes.c_int16, TOTAL_THREADS * MAX_CAPACITY)
+    shared_scores_base = ctx.Array(ctypes.c_int16, TOTAL_THREADS * MAX_CAPACITY)
     shared_data_bases = (shared_states_base, shared_values_base, shared_scores_base)
 
     pipes = [ctx.Pipe() for _ in range(TOTAL_THREADS)]
@@ -410,28 +550,36 @@ def run_training_pipeline(num_iteration=1000):
         batch_size = 64
         epochs = 4
         
-        np_states = np.array(replay_states, dtype=np.float32)
-        np_values = np.array(replay_values, dtype=np.float32).reshape(-1, 1)
-        np_scores = np.array(replay_scores, dtype=np.float32).reshape(-1, 1)
+        # Format the arrays exactly once
+        np_states = np.array(replay_states, dtype=np.float16)
+        np_values = np.array(replay_values, dtype=np.float16).reshape(-1, 1)
+        np_scores = np.array(replay_scores, dtype=np.float16).reshape(-1, 1)
+        
+        model.train()
+        
+        # Load the entire Dataset directly into Apple Silicon VRAM
+        mx_states = mx.array(np_states)
+        mx_values = mx.array(np_values)
+        mx_scores = mx.array(np_scores)
         
         indices = np.arange(current_buffer_size)
-        model.train()
         
         for epoch in range(epochs):
             np.random.shuffle(indices)
+            mx_indices = mx.array(indices) 
+            
             epoch_loss = 0.0
             num_batches = 0
             
             for i in range(0, current_buffer_size, batch_size):
-                batch_idx = indices[i:i+batch_size]
+                batch_idx = mx_indices[i:i+batch_size]
                 
-                # 🍏 explicitly cast training inputs to float16
-                batch_x = mx.array(np_states[batch_idx], dtype=mx.float16)
-                batch_yv = mx.array(np_values[batch_idx], dtype=mx.float16)
-                batch_ys = mx.array(np_scores[batch_idx], dtype=mx.float16)
+                batch_x = mx_states[batch_idx]
+                batch_yv = mx_values[batch_idx]
+                batch_ys = mx_scores[batch_idx]
                 
                 loss = train_step(batch_x, batch_yv, batch_ys)
-                mx.eval(loss, model.parameters(), optimizer.state)
+                mx.eval(loss, state)
                 epoch_loss += loss.item()
                 num_batches += 1
                 
@@ -443,7 +591,9 @@ def run_training_pipeline(num_iteration=1000):
         current_model_name = f"blokus_expert_v{iteration}.safetensors"
         model.save_weights(current_model_name)
         model.save_weights(weights_path)
-        optimizer.save_state(optim_path)
+        flat_optim_state = dict(tree_flatten(optimizer.state))
+        mx.save_safetensors(optim_path, flat_optim_state)        
+        print(f"💾 Saved generation {iteration} model and optimizer!", flush=True)
 
         with open(buffer_path, "wb") as f:
             pickle.dump((replay_states, replay_values, replay_scores, iteration + 1), f, protocol=pickle.HIGHEST_PROTOCOL)
