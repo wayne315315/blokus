@@ -24,7 +24,7 @@ NUM_WORKERS = 20
 
 MAX_CAPACITY = 2048
 
-NUM_THREADS = 5
+NUM_THREADS = 1
 TOTAL_THREADS = NUM_WORKERS * NUM_THREADS
 
 # ==========================================
@@ -155,7 +155,7 @@ def training_inference_server(conns, model, device, shared_counter, total_games,
         static_input_buffer = torch.zeros((CHUNK_SIZE, 20, 20, 8), dtype=torch.float32, device=device)
 
     while active_conns:
-        readable = multiprocessing.connection.wait(active_conns, timeout=0.001)
+        readable = multiprocessing.connection.wait(active_conns, timeout=0.0001)
         for p in readable:
             try:
                 msg = p.recv()
