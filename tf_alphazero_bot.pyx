@@ -121,7 +121,7 @@ cdef class ExpertBlokusBot:
         self.is_training = is_training
         self.c_puct = 1.5
         self.pipe_lock = threading.Lock()
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
         self.shape_keys = list(SHAPES.keys())
         self.shape_to_id = {name: idx for idx, name in enumerate(self.shape_keys)}
