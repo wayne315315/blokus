@@ -20,7 +20,7 @@ import os
 # Force Triton to use the DGX's native Blackwell-compatible assembler
 os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda/bin/ptxas"
 
-MAX_ORDER = 11
+MAX_ORDER = 9
 NUM_WORKERS = 20
 
 MAX_CAPACITY = 2048
@@ -376,11 +376,11 @@ def run_training_pipeline(num_iteration=2000):
             _ = fast_infer_model(dummy)
     print("✅ All dynamic graphs successfully compiled and cached!", flush=True)
     
-    TOTAL_GAMES_PER_ITERATION = 1000
+    TOTAL_GAMES_PER_ITERATION = 500
     games_per_thread = max(1, TOTAL_GAMES_PER_ITERATION // TOTAL_THREADS)
     actual_total_games = TOTAL_THREADS * games_per_thread
 
-    REPLAY_BUFFER_SIZE = 200000
+    REPLAY_BUFFER_SIZE = 100000
     start_iteration = 1
     
     buffer_path = "replay_buffer.pkl"

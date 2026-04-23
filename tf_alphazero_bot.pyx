@@ -121,7 +121,7 @@ cdef class ExpertBlokusBot:
         self.is_training = is_training
         self.c_puct = 1.5
         self.pipe_lock = threading.Lock()
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
         self.shape_keys = list(SHAPES.keys())
         self.shape_to_id = {name: idx for idx, name in enumerate(self.shape_keys)}
@@ -253,7 +253,7 @@ cdef class ExpertBlokusBot:
                     n.value_sum -= v_leaf
 
     cpdef get_action(self, list board, int color, dict inventories, dict first_moves, list legal_moves, bint is_training=True, bint fast_playout=False):
-        cdef int num_simulations = 6 if fast_playout else 32
+        cdef int num_simulations = 4 if fast_playout else 32
         cdef ExpertNode root = ExpertNode()
         cdef np.ndarray board_np = np.array(board, dtype=np.int32)
         cdef int[:, :] board_view = board_np
