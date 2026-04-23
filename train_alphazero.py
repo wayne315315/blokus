@@ -16,11 +16,10 @@ threading.stack_size(256 * 1024)
 
 from helper import BOARD_SIZE, SHAPES
 
-import os
 # Force Triton to use the DGX's native Blackwell-compatible assembler
 os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda/bin/ptxas"
 
-MAX_ORDER = 9
+MAX_ORDER = 8
 NUM_WORKERS = 20
 
 MAX_CAPACITY = 2048
@@ -29,7 +28,7 @@ NUM_THREADS = 5
 TOTAL_THREADS = NUM_WORKERS * NUM_THREADS
 
 # ==========================================
-# 2. Game Generation & Workers
+# 1. Game Generation & Workers
 # ==========================================
 def generate_expert_game(bot):
     states, players = [], []
@@ -129,13 +128,12 @@ def distributed_train_worker(conns, result_queue, thread_indices, shared_counter
         result_queue.put((S, V, SC, worker_total_turns))
 
 # ==========================================
-# 3. Inference Server
+# 2. Inference Server
 # ==========================================
 def training_inference_server(conns, model, device, shared_counter, total_games, shared_data_bases, total_threads):
     import torch 
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision('high')
-
 
     shared_states = np.ctypeslib.as_array(shared_data_bases[0]).reshape((total_threads, MAX_CAPACITY, 20, 20, 8))
     shared_values = np.ctypeslib.as_array(shared_data_bases[1]).reshape((total_threads, MAX_CAPACITY))
@@ -151,6 +149,10 @@ def training_inference_server(conns, model, device, shared_counter, total_games,
     CHUNK_SIZE =  2 ** MAX_ORDER
     MIN_BATCH_SIZE = 64
     is_cuda = device.type == 'cuda'
+
+    # 🚀 SETUP: Pre-allocate static GPU buffer for zero-overhead padding required by CUDA Graphs
+    if is_cuda:
+        static_input_buffer = torch.zeros((CHUNK_SIZE, 20, 20, 8), dtype=torch.float32, device=device)
 
     while active_conns:
         readable = multiprocessing.connection.wait(active_conns, timeout=0.001)
@@ -171,8 +173,6 @@ def training_inference_server(conns, model, device, shared_counter, total_games,
             t0 = time.time()
             
             # 🚀 DGX UMA OPTIMIZATION: Shift Concatenation entirely to the GPU
-            # By passing the memory maps directly to PyTorch via torch.from_numpy,
-            # we let the 4,000 GB/s Hopper architecture stitch the arrays together instantly.
             gpu_views = [
                 torch.from_numpy(shared_states[w_id, :size]).to(device, non_blocking=True)
                 for w_id, size in zip(ready_indices, batch_sizes)
@@ -184,7 +184,7 @@ def training_inference_server(conns, model, device, shared_counter, total_games,
             
             t1 = time.time()
             
-            # 🚀 DGX BULK TRANSFER: Pre-allocate output tensors to avoid multi-chunk CPU sync stalls
+            # 🚀 DGX BULK TRANSFER: Pre-allocate output tensors
             all_v = torch.empty(actual_size, dtype=torch.float32, device=device)
             all_s = torch.empty(actual_size, dtype=torch.float32, device=device)
             
@@ -200,12 +200,18 @@ def training_inference_server(conns, model, device, shared_counter, total_games,
                 
                 chunk_torch = batch_tensor_gpu[tensor_cursor : tensor_cursor + curr_size]
                 
-                if pad_target > curr_size:
-                    # Pad directly on GPU
-                    pad_array = torch.zeros((pad_target - curr_size, 20, 20, 8), dtype=torch.float32, device=device)
-                    chunk_padded = torch.cat([chunk_torch, pad_array], dim=0)
+                if is_cuda:
+                    # 🚀 ZERO-ALLOCATION STATIC PADDING
+                    static_input_buffer[:curr_size].copy_(chunk_torch)
+                    if pad_target > curr_size:
+                        static_input_buffer[curr_size:pad_target].zero_()
+                    chunk_padded = static_input_buffer[:pad_target]
                 else:
-                    chunk_padded = chunk_torch
+                    if pad_target > curr_size:
+                        pad_array = torch.zeros((pad_target - curr_size, 20, 20, 8), dtype=torch.float32, device=device)
+                        chunk_padded = torch.cat([chunk_torch, pad_array], dim=0)
+                    else:
+                        chunk_padded = chunk_torch
                     
                 with torch.no_grad():
                     if is_cuda:
@@ -214,13 +220,12 @@ def training_inference_server(conns, model, device, shared_counter, total_games,
                     else:
                         pred_v, pred_s = model(chunk_padded)
                         
-                # Store results strictly on the GPU memory block
                 all_v[tensor_cursor : tensor_cursor + curr_size] = pred_v.flatten()[:curr_size]
                 all_s[tensor_cursor : tensor_cursor + curr_size] = pred_s.flatten()[:curr_size]
                 
                 tensor_cursor += curr_size
                 rem -= curr_size
-            # 🚀 FIX: Force the CPU to wait until the GPU actually finishes the calculations
+                
             if is_cuda:
                 torch.cuda.synchronize()
             t_infer = (time.time() - t1) * 1000 
@@ -228,7 +233,6 @@ def training_inference_server(conns, model, device, shared_counter, total_games,
             
             t2 = time.time()
             
-            # Single bulk transfer back to CPU space (Effectively zero-cost over UMA C2C)
             v_numpy = all_v.cpu().numpy()
             sc_numpy = all_s.cpu().numpy()
             
@@ -258,7 +262,7 @@ def training_inference_server(conns, model, device, shared_counter, total_games,
     print("\n✅ All GPU processes finished gathering data.", flush=True)
 
 # ==========================================
-# 4. Main Training Pipeline
+# 3. Main Training Pipeline
 # ==========================================
 def run_training_pipeline(num_iteration=2000):
     ctx = mp.get_context('spawn')
@@ -362,9 +366,24 @@ def run_training_pipeline(num_iteration=2000):
         print("🚀 No existing model found. Building a new PyTorch AdvancedBlokusModel from scratch...", flush=True)
 
     is_mac = sys.platform == "darwin"
+    
     if not is_mac and hasattr(torch, "compile"):
-        print(f"🔥 Wrapping model with torch.compile for optimal execution...", flush=True)
-        fast_infer_model = torch.compile(model, mode="default", dynamic=True)
+        import torch._dynamo
+        # Raise cache limit to accommodate the various fixed bucket sizes during generation AND training batches
+        torch._dynamo.config.cache_size_limit = 64
+        
+        print(f"🔥 Wrapping model with torch.compile (Triton Fusion + CUDA Graphs Enabled)...", flush=True)
+        
+        # 🚀 FIX: Move max_autotune inside the options dictionary to prevent the RuntimeError
+        fast_infer_model = torch.compile(
+            model, 
+            fullgraph=True,
+            dynamic=False,  # Enforce strictly static shapes for CUDA Graphs to work optimally
+            options={
+                "max_autotune": True, 
+                "triton.cudagraphs": True
+            }
+        )
     else:
         fast_infer_model = model
 
@@ -373,7 +392,12 @@ def run_training_pipeline(num_iteration=2000):
     with torch.no_grad():
         for o in range(6, MAX_ORDER + 1):
             dummy = torch.zeros((2 ** o, 20, 20, 8), dtype=torch.float32, device=device)
-            _ = fast_infer_model(dummy)
+            if device.type == 'cuda':
+                # 🚀 MUST INCLUDE AUTOCAST IN WARMUP SO THE GRAPH CACHES THE FP16 PATH
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    _ = fast_infer_model(dummy)
+            else:
+                _ = fast_infer_model(dummy)
     print("✅ All dynamic graphs successfully compiled and cached!", flush=True)
     
     TOTAL_GAMES_PER_ITERATION = 500
@@ -451,7 +475,8 @@ def run_training_pipeline(num_iteration=2000):
         dataloader = DataLoader(dataset, batch_size=8192, shuffle=True, pin_memory=(device.type == 'cuda'), num_workers=0)
 
         print(f"🧠 Training Q-Value Neural Network...", flush=True)
-        fast_infer_model.train()
+        # Ensure base model trains correctly without compiling overhead during backward pass
+        model.train()
         
         epochs = 4
         for epoch in range(epochs):
@@ -465,7 +490,7 @@ def run_training_pipeline(num_iteration=2000):
                 
                 if device.type == 'cuda':
                     with torch.autocast(device_type='cuda', dtype=torch.float16):
-                        pred_v, pred_s = fast_infer_model(batch_x)
+                        pred_v, pred_s = model(batch_x)
                         loss_v = mse_loss_fn(pred_v, batch_yv)
                         loss_s = huber_loss_fn(pred_s, batch_ys)
                         loss = loss_v + 0.05 * loss_s
@@ -474,7 +499,7 @@ def run_training_pipeline(num_iteration=2000):
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    pred_v, pred_s = fast_infer_model(batch_x)
+                    pred_v, pred_s = model(batch_x)
                     loss_v = mse_loss_fn(pred_v, batch_yv)
                     loss_s = huber_loss_fn(pred_s, batch_ys)
                     loss = loss_v + 0.05 * loss_s
