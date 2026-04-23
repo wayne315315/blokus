@@ -10,13 +10,12 @@ import concurrent.futures
 from helper import BOARD_SIZE, SHAPES
 from player import BotPlayer  
 
-MAX_ORDER = 11
-_NUM_CPUS = mp.cpu_count()
-NUM_WORKERS = 32
+MAX_ORDER = 8
+NUM_WORKERS = 20
 
 MAX_CAPACITY = 2048
 
-NUM_THREADS = 4
+NUM_THREADS = 1
 TOTAL_THREADS = NUM_WORKERS * NUM_THREADS
 
 def play_test_game(adv_bot, std_bot_1, std_bot_2, play_as_first):
@@ -105,9 +104,10 @@ def distributed_test_worker(games_per_thread, worker_conns, result_queue, worker
             
     result_queue.put([az_wins, std_wins, ties, az_score_diff])
 
-# 🚀 FIX: Signature expects the true PyTorch model now, exactly like train_alphazero.py
 def test_inference_server(conns, model, device, shared_counter, total_games, shared_data_bases, total_threads):
     import torch 
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision('high')
 
     shared_states = np.ctypeslib.as_array(shared_data_bases[0]).reshape((total_threads, MAX_CAPACITY, 20, 20, 8))
     shared_values = np.ctypeslib.as_array(shared_data_bases[1]).reshape((total_threads, MAX_CAPACITY))
@@ -122,15 +122,14 @@ def test_inference_server(conns, model, device, shared_counter, total_games, sha
     
     CHUNK_SIZE = 2 ** MAX_ORDER
     MIN_BATCH_SIZE = 64
-
-    MAX_SAFE_BATCH = total_threads * 256
-    print(f"🔥 Allocating Efficient Server Buffer ({MAX_SAFE_BATCH} states) in System RAM...", flush=True)
-    SERVER_BUFFER = np.empty((MAX_SAFE_BATCH, 20, 20, 8), dtype=np.float32)
-
     is_cuda = device.type == 'cuda'
 
+    # 🚀 SETUP: Pre-allocate static GPU buffer for zero-overhead padding required by CUDA Graphs
+    if is_cuda:
+        static_input_buffer = torch.zeros((CHUNK_SIZE, 20, 20, 8), dtype=torch.float32, device=device)
+
     while active_conns:
-        readable = multiprocessing.connection.wait(active_conns, timeout=0.001)
+        readable = multiprocessing.connection.wait(active_conns, timeout=0.0001)
         for p in readable:
             try:
                 msg = p.recv()
@@ -147,22 +146,21 @@ def test_inference_server(conns, model, device, shared_counter, total_games, sha
         if total_states_queued > 0:
             t0 = time.time()
             
-            total_incoming = sum(batch_sizes)
-            if total_incoming > MAX_SAFE_BATCH:
-                views = [shared_states[w_id, :size] for w_id, size in zip(ready_indices, batch_sizes)]
-                batch_tensor = np.concatenate(views, axis=0)
-            else:
-                actual_size = 0
-                for w_id, size in zip(ready_indices, batch_sizes):
-                    SERVER_BUFFER[actual_size : actual_size + size] = shared_states[w_id, :size]
-                    actual_size += size
-                batch_tensor = SERVER_BUFFER[:actual_size]
-                
-            actual_size = batch_tensor.shape[0]
+            # 🚀 DGX UMA OPTIMIZATION: Shift Concatenation entirely to the GPU
+            gpu_views = [
+                torch.from_numpy(shared_states[w_id, :size]).to(device, non_blocking=True)
+                for w_id, size in zip(ready_indices, batch_sizes)
+            ]
+            batch_tensor_gpu = torch.cat(gpu_views, dim=0)
+            
+            actual_size = batch_tensor_gpu.shape[0]
             t_copy = (time.time() - t0) * 1000
             
             t1 = time.time()
-            v_preds, sc_preds = [], []
+            
+            # 🚀 DGX BULK TRANSFER: Pre-allocate output tensors
+            all_v = torch.empty(actual_size, dtype=torch.float32, device=device)
+            all_s = torch.empty(actual_size, dtype=torch.float32, device=device)
             
             tensor_cursor = 0
             rem = actual_size
@@ -174,34 +172,44 @@ def test_inference_server(conns, model, device, shared_counter, total_games, sha
                 if pad_target < MIN_BATCH_SIZE: 
                     pad_target = MIN_BATCH_SIZE
                 
-                chunk = batch_tensor[tensor_cursor : tensor_cursor + curr_size]
+                chunk_torch = batch_tensor_gpu[tensor_cursor : tensor_cursor + curr_size]
                 
-                if pad_target > curr_size:
-                    pad_array = np.zeros((pad_target - curr_size, 20, 20, 8), dtype=np.float32)
-                    chunk_padded = np.concatenate([chunk, pad_array], axis=0)
+                if is_cuda:
+                    # 🚀 ZERO-ALLOCATION STATIC PADDING
+                    static_input_buffer[:curr_size].copy_(chunk_torch)
+                    if pad_target > curr_size:
+                        static_input_buffer[curr_size:pad_target].zero_()
+                    chunk_padded = static_input_buffer[:pad_target]
                 else:
-                    chunk_padded = chunk
+                    if pad_target > curr_size:
+                        pad_array = torch.zeros((pad_target - curr_size, 20, 20, 8), dtype=torch.float32, device=device)
+                        chunk_padded = torch.cat([chunk_torch, pad_array], dim=0)
+                    else:
+                        chunk_padded = chunk_torch
                     
-                chunk_torch = torch.from_numpy(chunk_padded).to(device)
                 with torch.no_grad():
                     if is_cuda:
                         with torch.autocast(device_type='cuda', dtype=torch.float16):
-                            pred_v, pred_s = model(chunk_torch)
+                            pred_v, pred_s = model(chunk_padded)
                     else:
-                        pred_v, pred_s = model(chunk_torch)
+                        pred_v, pred_s = model(chunk_padded)
                         
-                v_preds.append(pred_v.cpu().numpy().flatten()[:curr_size])
-                sc_preds.append(pred_s.cpu().numpy().flatten()[:curr_size])
+                all_v[tensor_cursor : tensor_cursor + curr_size] = pred_v.flatten()[:curr_size]
+                all_s[tensor_cursor : tensor_cursor + curr_size] = pred_s.flatten()[:curr_size]
                 
                 tensor_cursor += curr_size
                 rem -= curr_size
                 
+            if is_cuda:
+                torch.cuda.synchronize()
             t_infer = (time.time() - t1) * 1000 
             t_per_sample = (t_infer / actual_size) if actual_size > 0 else 0.0
             
             t2 = time.time()
-            v_numpy = np.concatenate(v_preds)
-            sc_numpy = np.concatenate(sc_preds)
+            
+            # Single bulk transfer back to CPU space
+            v_numpy = all_v.cpu().numpy()
+            sc_numpy = all_s.cpu().numpy()
             
             cursor = 0
             for w_id, size in zip(ready_indices, batch_sizes):
@@ -227,7 +235,7 @@ def test_inference_server(conns, model, device, shared_counter, total_games, sha
             
     print("\n✅ All test games completed!", flush=True)
 
-def test_model(num_games=128):
+def test_model(num_games=100):
     ctx = mp.get_context('spawn')
     
     shared_counter = ctx.Value('i', 0)
@@ -326,19 +334,36 @@ def test_model(num_games=128):
     model.eval()
 
     is_mac = sys.platform == "darwin"
+    
+    # 🚀 SETUP: Enable Triton Fusion and CUDA Graphs for the Testing loop
     if not is_mac and hasattr(torch, "compile"):
-        print(f"🔥 Wrapping model with torch.compile for optimal execution...", flush=True)
-        fast_infer_model = torch.compile(model, mode="default", dynamic=True)
+        import torch._dynamo
+        torch._dynamo.config.cache_size_limit = 64
+        
+        print(f"🔥 Wrapping model with torch.compile (Triton Fusion + CUDA Graphs Enabled)...", flush=True)
+        fast_infer_model = torch.compile(
+            model, 
+            fullgraph=True,
+            dynamic=False,  
+            options={
+                "max_autotune": True, 
+                "triton.cudagraphs": True
+            }
+        )
     else:
         fast_infer_model = model
 
-    # 🚀 FIX: The broken wrapper function was deleted here
-
+    # 🚀 JIT COMPILE AND GRAPH RECORDING WARMUP
     print(f"🔥 Pre-compiling Power-of-2 Buckets (64 to {2 ** MAX_ORDER}) into System RAM...", flush=True)
+    fast_infer_model.eval()
     with torch.no_grad():
         for p in range(6, MAX_ORDER + 1):
             dummy = torch.zeros((2 ** p, 20, 20, 8), dtype=torch.float32, device=device)
-            _ = fast_infer_model(dummy)
+            if device.type == 'cuda':
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    _ = fast_infer_model(dummy)
+            else:
+                _ = fast_infer_model(dummy)
     print("✅ All dynamic graphs successfully compiled and cached!", flush=True)
 
     print("="*60, flush=True)
@@ -347,7 +372,6 @@ def test_model(num_games=128):
 
     start_time = time.time()
     
-    # 🚀 FIX: Pass fast_infer_model directly
     test_inference_server(parent_conns, fast_infer_model, device, shared_counter, num_games, shared_data_bases, TOTAL_THREADS)
 
     total_aw, total_sw, total_t, total_diff = 0, 0, 0, 0
