@@ -19,7 +19,11 @@ from helper import BOARD_SIZE, SHAPES
 # Force Triton to use the DGX's native Blackwell-compatible assembler
 os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda/bin/ptxas"
 
-MAX_ORDER = 8
+# config
+BLOCKS = 8
+FILTERS = 64
+
+MAX_ORDER = 7
 NUM_WORKERS = 20
 
 MAX_CAPACITY = 2048
@@ -364,7 +368,7 @@ def run_training_pipeline(num_iteration=2000):
 
     dprint(f"🔥 Cluster Rank {rank}/{world_size} Using device: {device}", flush=True)
 
-    model = PyTorchAdvancedBlokusModel().to(device)
+    model = PyTorchAdvancedBlokusModel(num_blocks=BLOCKS, filters=FILTERS).to(device)
     
     model_path = "blokus_expert_latest.pt"
     start_iteration = 1
@@ -383,7 +387,7 @@ def run_training_pipeline(num_iteration=2000):
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
     is_mac = sys.platform == "darwin"
-    fast_infer_model = PyTorchAdvancedBlokusModel().to(device)
+    fast_infer_model = PyTorchAdvancedBlokusModel(num_blocks=BLOCKS, filters=FILTERS).to(device)
 
     if not is_mac and hasattr(torch, "compile"):
         import torch._dynamo
