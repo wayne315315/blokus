@@ -2,8 +2,8 @@
 
 # git clone
 git clone https://github.com/wayne315315/blokus.git
-git checkout torch
 cd blokus
+git checkout torch
 
 # Install dependencies
 apt update && apt install -y python3.12-dev python3.12-venv
