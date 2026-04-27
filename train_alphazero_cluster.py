@@ -15,15 +15,13 @@ import pickle
 threading.stack_size(256 * 1024)
 
 from helper import BOARD_SIZE, SHAPES
+from const import BLOCKS, FILTERS
+
 
 # Force Triton to use the DGX's native Blackwell-compatible assembler
 os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda/bin/ptxas"
 
-# config
-BLOCKS = 8
-FILTERS = 64
-
-MAX_ORDER = 7
+MAX_ORDER = 8
 NUM_WORKERS = 20
 
 MAX_CAPACITY = 2048
@@ -273,6 +271,9 @@ def run_training_pipeline(num_iteration=2000):
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel as DDP
 
+    # 🚀 IMPORT MODEL FROM model.py
+    from model import PyTorchAdvancedBlokusModel
+
     # 🚀 DDP CLUSTER: Initialize NCCL backend for QSFP56 InfiniBand communication
     if not dist.is_initialized():
         dist.init_process_group(backend='nccl')
@@ -315,56 +316,6 @@ def run_training_pipeline(num_iteration=2000):
 
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision('high')
-
-    class ResBlock(nn.Module):
-        def __init__(self, filters):
-            super().__init__()
-            self.conv1 = nn.Conv2d(filters, filters, 3, padding=1, bias=False)
-            self.bn1 = nn.BatchNorm2d(filters)
-            self.conv2 = nn.Conv2d(filters, filters, 3, padding=1, bias=False)
-            self.bn2 = nn.BatchNorm2d(filters)
-            self.dense_g = nn.Linear(filters, filters, bias=False)
-
-        def forward(self, x):
-            shortcut = x
-            out = F.relu(self.bn1(self.conv1(x)))
-            out = self.bn2(self.conv2(out))
-            g = out.mean(dim=(2, 3))
-            g = self.dense_g(g)
-            g = g.view(g.size(0), g.size(1), 1, 1)
-            out = out + g
-            out = out + shortcut
-            return F.relu(out)
-
-    class PyTorchAdvancedBlokusModel(nn.Module):
-        def __init__(self, board_size=20, num_blocks=4, filters=16):
-            super().__init__()
-            self.board_size = board_size
-            self.conv_init = nn.Conv2d(8, filters, 3, padding=1, bias=False)
-            self.bn_init = nn.BatchNorm2d(filters)
-            self.res_blocks = nn.ModuleList([ResBlock(filters) for _ in range(num_blocks)])
-            self.conv_v = nn.Conv2d(filters, 1, 1, padding=0, bias=False)
-            self.bn_v = nn.BatchNorm2d(1)
-            self.dense_v1 = nn.Linear(board_size * board_size, 256)
-            self.dense_v2 = nn.Linear(256, 1)
-            self.conv_s = nn.Conv2d(filters, 1, 1, padding=0, bias=False)
-            self.bn_s = nn.BatchNorm2d(1)
-            self.dense_s1 = nn.Linear(board_size * board_size, 256)
-            self.dense_s2 = nn.Linear(256, 1)
-
-        def forward(self, x):
-            x = x.permute(0, 3, 1, 2).contiguous()
-            x = F.relu(self.bn_init(self.conv_init(x)))
-            for block in self.res_blocks: x = block(x)
-            v = F.relu(self.bn_v(self.conv_v(x)))
-            v = v.view(v.size(0), -1) 
-            v = F.relu(self.dense_v1(v))
-            value_out = torch.tanh(self.dense_v2(v))
-            s = F.relu(self.bn_s(self.conv_s(x)))
-            s = s.view(s.size(0), -1) 
-            s = F.relu(self.dense_s1(s))
-            score_out = self.dense_s2(s)
-            return value_out, score_out
 
     dprint(f"🔥 Cluster Rank {rank}/{world_size} Using device: {device}", flush=True)
 
@@ -417,12 +368,21 @@ def run_training_pipeline(num_iteration=2000):
                 _ = fast_infer_model(dummy)
     dprint("✅ All dynamic graphs successfully compiled and cached!", flush=True)
     
-    TOTAL_GAMES_PER_ITERATION = 500
-    games_per_thread = max(1, TOTAL_GAMES_PER_ITERATION // TOTAL_THREADS)
-    actual_total_games = TOTAL_THREADS * games_per_thread
+    # ---------------------------------------------------------
+    # 🚀 DDP CLUSTER SCALING: Convert Global Targets to Local
+    # ---------------------------------------------------------
+    GLOBAL_TOTAL_GAMES = 500
+    GLOBAL_BUFFER_SIZE = 100000
+    GLOBAL_BATCH_SIZE  = 8192
 
-    REPLAY_BUFFER_SIZE = 100000
+    local_total_games = max(1, GLOBAL_TOTAL_GAMES // world_size)
+    local_buffer_size = max(1, GLOBAL_BUFFER_SIZE // world_size)
+    local_batch_size  = max(1, GLOBAL_BATCH_SIZE // world_size)
     
+    games_per_thread = max(1, local_total_games // TOTAL_THREADS)
+    actual_local_games = TOTAL_THREADS * games_per_thread
+    # ---------------------------------------------------------
+
     # 🚀 DDP CLUSTER: Each node saves/loads its OWN replay buffer locally
     buffer_path = f"replay_buffer_rank{rank}.pkl"
     if os.path.exists(buffer_path):
@@ -434,12 +394,17 @@ def run_training_pipeline(num_iteration=2000):
             else:
                 replay_states, replay_values, replay_scores = data
                 start_iteration = 1
+                
+        # Re-apply dynamic maxlen to loaded histories to ensure perfect memory scaling
+        replay_states = deque(replay_states, maxlen=local_buffer_size)
+        replay_values = deque(replay_values, maxlen=local_buffer_size)
+        replay_scores = deque(replay_scores, maxlen=local_buffer_size)
         dprint(f"✅ Successfully loaded {len(replay_states)} historical states. Resuming at Iteration {start_iteration}.", flush=True)
     else:
         dprint(f"💾 No existing Replay Buffer found. Initializing empty queues.", flush=True)
-        replay_states = deque(maxlen=REPLAY_BUFFER_SIZE)
-        replay_values = deque(maxlen=REPLAY_BUFFER_SIZE)
-        replay_scores = deque(maxlen=REPLAY_BUFFER_SIZE)
+        replay_states = deque(maxlen=local_buffer_size)
+        replay_values = deque(maxlen=local_buffer_size)
+        replay_scores = deque(maxlen=local_buffer_size)
 
     mse_loss_fn = nn.MSELoss()
     huber_loss_fn = nn.HuberLoss(delta=1.0)
@@ -452,7 +417,7 @@ def run_training_pipeline(num_iteration=2000):
             param_group['lr'] = current_lr
 
         dprint(f"\n" + "="*70, flush=True)
-        dprint(f"🚀 STARTING Q-LEARNING ITERATION {iteration} | LR: {current_lr:.2e} | Generating {actual_total_games} Games/Node", flush=True)
+        dprint(f"🚀 STARTING Q-LEARNING ITERATION {iteration} | LR: {current_lr:.2e} | Generating {actual_local_games} Games/Node", flush=True)
         dprint("="*70, flush=True)
         
         start_time = time.time()
@@ -465,7 +430,7 @@ def run_training_pipeline(num_iteration=2000):
         for _ in range(NUM_WORKERS):
             cmd_queue.put(games_per_thread)
 
-        training_inference_server(parent_conns, fast_infer_model, device, shared_counter, actual_total_games, shared_data_bases, TOTAL_THREADS, rank)
+        training_inference_server(parent_conns, fast_infer_model, device, shared_counter, actual_local_games, shared_data_bases, TOTAL_THREADS, rank)
 
         S, V, SC = [], [], []
         iteration_total_turns = 0
@@ -476,7 +441,7 @@ def run_training_pipeline(num_iteration=2000):
             iteration_total_turns += turns
         
         generation_time = time.time() - start_time
-        avg_game_length = iteration_total_turns / actual_total_games
+        avg_game_length = iteration_total_turns / actual_local_games if actual_local_games > 0 else 0
         
         dprint(f"\n✅ Node {rank} Data Gen Complete in {generation_time:.1f}s | Extracted {len(S)} New States | EXACT Avg Turns/Game: {avg_game_length:.1f}", flush=True)
         
@@ -485,14 +450,14 @@ def run_training_pipeline(num_iteration=2000):
         replay_scores.extend(SC)
         
         current_buffer_size = len(replay_states)
-        dprint(f"🧠 Node {rank} Replay Buffer Size: {current_buffer_size} / {REPLAY_BUFFER_SIZE}. Constructing Pipeline...", flush=True)
+        dprint(f"🧠 Node {rank} Replay Buffer Size: {current_buffer_size} / {local_buffer_size}. Constructing Pipeline...", flush=True)
         
         tensor_x = torch.from_numpy(np.array(replay_states, dtype=np.float32))
         tensor_v = torch.from_numpy(np.array(replay_values, dtype=np.float32).reshape(-1, 1))
         tensor_s = torch.from_numpy(np.array(replay_scores, dtype=np.float32).reshape(-1, 1))
         
         dataset = TensorDataset(tensor_x, tensor_v, tensor_s)
-        dataloader = DataLoader(dataset, batch_size=8192, shuffle=True, pin_memory=(device.type == 'cuda'), num_workers=0)
+        dataloader = DataLoader(dataset, batch_size=local_batch_size, shuffle=True, pin_memory=(device.type == 'cuda'), num_workers=0)
 
         dprint(f"🧠 Training Q-Value Neural Network (Gradients Syncing via QSFP56)...", flush=True)
         model.train()
